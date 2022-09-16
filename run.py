@@ -10,8 +10,8 @@ Updated 2022-08-10
 import argparse
 from email import header
 import os
-from re import S
 import pandas as pd
+import sys
 # import boto3  # TODO Use this for interfacing with s3
 
 # Nonstandard imports
@@ -19,16 +19,12 @@ import pandas as pd
 #import s3_audit as s3  # TODO import from https://github.com/DCAN-Labs/abcd-dicom2bids/blob/audit-dev/src/audit/s3_audit.py
 #import tier1_audit as tier1   # TODO import from https://github.com/DCAN-Labs/abcd-dicom2bids/blob/audit-dev/src/audit/tier1_audit.py
 from src.utilities import (
-    get_sub_ses_df_from_tier1, query_split_by_anat, query_processed_subjects,
+    DICOM2BIDS, dict_has, get_sub_ses_df_from_tier1, 
+    get_tier1_or_tier2_ERI_db_fname, HCPIPELINE, PATH_DICOM_DB,
+    PATH_NGDR, query_split_by_anat, query_processed_subjects,
     query_has_anat, query_unprocessed_subjects, save_to_hash_map_table,
     valid_output_dir, valid_readable_dir, valid_readable_file,
 )
-
-# Constants: Pipeline names, database path, & temporarily hardcoded dirpath
-DICOM2BIDS = "abcd-dicom2bids"
-HCPIPELINE = "abcd-hcp-pipeline"
-PATH_DICOM_DB = "/home/rando149/shared/code/internal/utilities/abcd-dicom2bids/src/audit/ABCD_BIDS_db.csv"
-PATH_NGDR = "/spaces/ngdr/ref-data/abcd/nda-3165-2020-09/"
 
 
 # Functions
@@ -74,6 +70,13 @@ def main():
                 # Run s3_audit.py functions
 
 
+def update_w_sub_ses_ERI_counts(eri_db_fpath, pre_eri_db, non_ID_col_names):
+    db_ERI = pd.read_csv(eri_db_fpath)
+    pre_eri_db[get_ERI_col_name(eri_db_fpath)
+               ] = db_ERI[non_ID_col_names].apply(lambda row: row.count(), axis=1)
+    return pre_eri_db
+
+
 def audit_abcd_dicom2bids(dicom_db, cli_args):
     # DICOM2BIDS FLOW
     bids_columns = ["bids_subject_id", "bids_session_id"]
@@ -88,35 +91,44 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
     # Output: List of excluded subjects for that year, and BIDS DB with them excluded
     dicom_db_with_anat, dicom_db_no_anat = query_split_by_anat(dicom_db)
 
+    # Get names of every column without identifying information or ERI counts
+    non_ID_col_names = get_non_ID_col_names_from(
+        dicom_db_with_anat, sub_col, ses_col, *bids_columns,
+        *[get_ERI_col_name(fpath) for fpath in cli_args["ERI_DB"]]
+    )
+
     # Get all subject sessions that user already uploaded to the NDA
+    # TODO Reorganize so that we count the NGDR statuses before checking uploads
     already_uploaded = list()
-    for each_csv_path in cli_args["uploaded"]:  
-        already_uploaded.append(pd.read_csv(each_csv_path))
-        assert already_uploaded[-1].columns.values.tolist() == bids_columns
-    already_uploaded = pd.concat(already_uploaded)  # TODO Maybe we should make this a subset of the dicom_db
-    uploaded_with_anat = pd.merge(dicom_db_with_anat, already_uploaded,
-                                  how="inner", left_on=[sub_col, ses_col],
-                                  right_on=bids_columns, indicator=True)
-    # uploaded_with_anat = uploaded_with_anat[uploaded_with_anat["_merge"] == "right_only"]
-    non_ID_col_names = uploaded_with_anat.columns.values.tolist()
-    for name_of_ID_col in (sub_col, ses_col, *bids_columns):
-        try: non_ID_col_names.remove(name_of_ID_col)
-        except ValueError: pass
-    uploaded_with_anat.columns = [sub_col, ses_col, *bids_columns, *non_ID_col_names]
-    non_ID_col_names.remove("_merge")
-    
+    if dict_has(cli_args, "uploaded"):
+        for each_csv_path in cli_args["uploaded"]:  
+            already_uploaded.append(pd.read_csv(each_csv_path))
+            assert already_uploaded[-1].columns.values.tolist() == bids_columns
+        already_uploaded = pd.concat(already_uploaded)  # TODO Maybe we should make this a subset of the dicom_db
+        uploaded_with_anat = pd.merge(dicom_db_with_anat, already_uploaded,
+                                    how="inner", left_on=[sub_col, ses_col],
+                                    right_on=bids_columns, indicator=True)
+        # uploaded_with_anat = uploaded_with_anat[uploaded_with_anat["_merge"] == "right_only"]
+        # non_ID_col_names = get_non_ID_col_names_from(uploaded_with_anat, sub_col, ses_col, *bids_columns)
+        uploaded_with_anat.columns = [sub_col, ses_col, *bids_columns, *non_ID_col_names, "_merge"]
+        # non_ID_col_names.remove("_merge")
+
     # For each year, check/count every subject-session's BIDS conversion status
     counts = dict()
     ses_DBs = dict()
-
     sub_ses_df_BIDS_NGDR = get_sub_ses_df_from_tier1(PATH_NGDR, sub_col,
-                                                     ses_col)
+                                                    ses_col)
 
-    
+    # Count ERI files per subject session (TODO FIX & TEST)
+    # non_ID_cols = [col for col in dicom_db_with_anat.columns.values.tolist() if "task-"]
+    for eachfpath in cli_args["ERI_DB"]:
+        dicom_db_with_anat = update_w_sub_ses_ERI_counts(  # [get_ERI_col_name(eachfpath)]
+                                eachfpath, dicom_db_with_anat, non_ID_col_names
+                            )
+
     for session in sessions:
         counts[session] = dict()
         ses_DBs[session] = dict()
-
 
         # Split dicoms_db by session and by whether BIDS conversion succeeded
         session_db = dicom_db_with_anat.loc[dicom_db_with_anat["session"] == session]
@@ -125,8 +137,17 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
             "Succeeded": query_processed_subjects(session_db),
             "Failed": query_unprocessed_subjects(session_db),
             "No-anat": dicom_db_no_anat[dicom_db_no_anat["session"] == session],
-            "Already-uploaded": uploaded_with_anat[uploaded_with_anat["session"] == session]  # TODO We also want the opposite of this (subject-sessions with anat that have not been uploaded) and, of those, how many succeeded BIDS conversion
         }
+
+        if "uploaded_with_anat" in locals():
+            ses_DBs[session]["Already-uploaded"] = uploaded_with_anat[
+                uploaded_with_anat["session"] == session
+            ]  # TODO We also want the opposite of this (subject-sessions with anat that have not been uploaded) and, of those, how many succeeded BIDS conversion
+
+        for eachfpath in cli_args["ERI_DB"]:
+            col_ERI = get_ERI_col_name(eachfpath)
+            ses_DBs[session][col_ERI] = session_db[session_db[col_ERI] > 0]
+            # print(ses_DBs[session][col_ERI])
 
         # TODO If user provided list of previously-uploaded subject-sessions, 
         #      remove each one from this uploads_subject_list
@@ -136,6 +157,7 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
             "{}" + "_{}_{}_subject-list.csv".format(DICOM2BIDS, session)
         )
 
+
         # For subjects who succeeded with anat, check which made it to the NGDR
         ses_DBs[session]["NGDR"] = pd.merge(
             ses_DBs[session]["Succeeded"], sub_ses_df_BIDS_NGDR,
@@ -143,8 +165,8 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
         )
         ses_DBs[session]["Not yet NGDR"] = pd.merge(
             ses_DBs[session]["Succeeded"], ses_DBs[session]["NGDR"],
-            how="outer", on=[sub_col, ses_col, *non_ID_col_names]
-        )
+            how="outer", on=[sub_col, ses_col, *non_ID_col_names]  # TODO This will break with no uploads .csv, fix it
+        ) 
 
         # Count how many subjects succeeded vs. failed BIDS conversion
         print()
@@ -161,6 +183,11 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
                           ].format(convert_status.replace(" ", "_")),
                 columns=[sub_col, ses_col], index=False, header=bids_columns
             )
+
+        for eachfpath in cli_args["ERI_DB"]:
+            col_ERI = get_ERI_col_name(eachfpath)
+            print("Total number of ERI files for {} from {}: {}"
+                  .format(session, col_ERI, session_db[col_ERI].sum()))
 
         # For each subject-session,
         
@@ -264,6 +291,15 @@ def _cli(audit_names):
               "directory.")
     )
 
+    parser.add_argument(
+        "-E", "-ERI-DB", "--eri-paths-db", dest="ERI_DB",
+        type=valid_readable_file, nargs="+",
+        help=("Valid path(s) to existing .csv file(s) which include the paths "
+              "(on tier1/MSI or tier2/s3) to EventRelatedInformation.txt "
+              "files for each subject session. Include this argument to count "
+              "how many subject sessions have ERI paths in the .csv file(s).")
+    )
+
     parser.add_argument(  # Only required if running DICOM DB Flow
         "-ftqc", "--fasttrack-qc", dest="fasttrack_qc", action="store_true",
         help=("Include this flag to generate abcd-dicom2bids database")
@@ -299,7 +335,32 @@ def _cli(audit_names):
               "uploaded to the NDA.")
     )
 
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help=("Include this flag to print more info to stdout while running")
+    )
+
     return vars(parser.parse_args())
+
+
+def get_ERI_info(cli_args):
+    saved_ERI_tier = dict()
+    for tier in (1, 2):
+        if os.path.exists(get_tier1_or_tier2_ERI_db_fname(cli_args["output"], tier)):
+            saved_ERI_tier[tier] = pd.read_csv()
+
+
+def get_ERI_col_name(eri_db_fpath):
+    return "ERI from {}".format(os.path.basename(eri_db_fpath))
+                        
+
+def get_non_ID_col_names_from(a_db, sub_col, ses_col, *bids_columns):
+    non_ID_col_names = a_db.columns.values.tolist()
+    for name_of_ID_col in (sub_col, ses_col, *bids_columns):
+        try: non_ID_col_names.remove(name_of_ID_col)
+        except ValueError: pass
+    return non_ID_col_names
 
 
 def get_dicom_db(cli_args):
@@ -310,7 +371,6 @@ def get_dicom_db(cli_args):
 def save_table_to_text_file(): pass
 def save_table_to_csv_file(): pass
 def map_paths_from_storage_to_NGDR(tier1_or_s3_in_dirpath, ngdr_out_dirpath, all_subject_sessions):
-
     # return hash table contents to put in a text file mapping (for each subject-session) s3 bucket paths to NGDR paths (one mapping per line, 2 space-separated paths)
     pass
 

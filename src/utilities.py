@@ -12,9 +12,28 @@ import nibabel as nib
 import numpy as np
 import os
 
+# Constants: Pipeline names, database path, & temporarily hardcoded dirpath
+DICOM2BIDS = "abcd-dicom2bids"
+HCPIPELINE = "abcd-hcp-pipeline"
+PATH_DICOM_DB = "/home/rando149/shared/code/internal/utilities/abcd-dicom2bids/src/audit/ABCD_BIDS_db.csv"
+PATH_NGDR = "/spaces/ngdr/ref-data/abcd/nda-3165-2020-09/"
+
 
 def main():
     pd.set_option('display.max_columns', None)
+
+
+def dict_has(a_dict, a_key):
+    """
+    :param a_dict: Dictionary (any)
+    :param a_key: Object (any)
+    :return: True if and only if a_key is mapped to something truthy in a_dict
+    """
+    return a_key in a_dict and a_dict[a_key]
+
+
+def get_tier1_or_tier2_ERI_db_fname(parent_dir, tier):
+    return os.path.join(parent_dir, "ERI_tier{}_paths_bids_db.csv".format(tier))
 
 
 def get_sub_ses_df_from_tier1(tier1_dirpath, sub_col, ses_col):

@@ -3,7 +3,7 @@
 """
 AWS s3 ABCC Audit Script
 Last Updated by Anders Perrone 2022-06-30
-Last Updated by Greg Conan 2022-09-15
+Last Updated by Greg Conan 2022-09-27
 """
 # Standard imports
 import argparse
@@ -16,7 +16,8 @@ import subprocess as sp
 import urllib.parse
 
 # Local custom imports
-from utilities import (get_tier1_or_tier2_ERI_db_fname, PATH_DICOM_DB,
+from utilities import (get_ERI_filepath,
+                       get_tier1_or_tier2_ERI_db_fname, PATH_DICOM_DB,
                        PATH_NGDR, valid_output_dir, valid_readable_dir)
 
 
@@ -78,7 +79,8 @@ def generate_parser(parser=None):
               "by your AWS secret key. Otherwise, by default this script will "
               "try to infer both keys by running the 's3info' command, and if "
               "that fails then you will be prompted to manually enter both "
-              "keys (hidden from the terminal).")
+              "keys (hidden from the terminal). Enter the word 'manual' to "
+              "skip the s3info check and enter keys manually.")
     )
     parser.add_argument(
         "-out",
@@ -366,21 +368,6 @@ def s3_get_subject_dict(sub_ses_imgs, subject, session, assign_to_header):
     return subject_dict
 
 
-def get_ERI_filepath(parent, subj_ID, session, task, run):
-    """
-    :param parent: String, valid path to tier1 directory (e.g.
-                   "/home/nda-3165-2020-09/") or s3 bucket (e.g. "s3://bucket")
-    :param subj_ID: String naming a subject ID
-    :param session: String naming a session
-    :param task: String naming a task
-    :param run: Int or string, the run number
-    :return: String, valid path to an EventRelatedInformation.txt file
-    """
-    return os.path.join(parent, "sourcedata", subj_ID, session, "func",
-                        f"{subj_ID}_{session}_task-{task}_run-{run}_bold_"
-                        "EventRelatedInformation.txt")
-
-
 def get_and_validate_AWS_s3_credentials(cli_args, parser):
     """
     Get AWS credentials, either from s3info or from the user entering them
@@ -391,15 +378,17 @@ def get_and_validate_AWS_s3_credentials(cli_args, parser):
     key_names = ("access key", "secret key")  # AWS s3 key names
     aws_creds = dict()  # Return value
     aws_keys = cli_args.get("aws_keys")
-    if aws_keys:
+    if aws_keys == ["manual"]:
+        aws_keys = list()
+    elif aws_keys:
         for i in range(len(key_names)):
             aws_creds[key_names[i]] = aws_keys[i]
     else:
         try: aws_creds = get_s3info()
         except (sp.CalledProcessError, ValueError): pass
-        for each_key in key_names:
-            if not aws_creds.get(each_key):
-                aws_creds[each_key] = get_AWS_credential(each_key, cli_args)
+    for each_key in key_names:
+        if not aws_creds.get(each_key):
+            aws_creds[each_key] = get_AWS_credential(each_key, cli_args)
             aws_keys.append(aws_creds[each_key])
     validate_aws_keys_args(aws_keys, parser)
     return aws_creds

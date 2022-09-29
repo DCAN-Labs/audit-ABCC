@@ -4,11 +4,12 @@
 ABCC Audit Main Script 
 Greg Conan: gconan@umn.edu
 Created 2022-07-06
-Updated 2022-08-10
+Updated 2022-09-28
 """
 # Standard imports
 import argparse
-from email import header
+from datetime import datetime
+import numpy as np
 import os
 import pandas as pd
 import sys
@@ -19,9 +20,9 @@ import sys
 #import s3_audit as s3  # TODO import from https://github.com/DCAN-Labs/abcd-dicom2bids/blob/audit-dev/src/audit/s3_audit.py
 #import tier1_audit as tier1   # TODO import from https://github.com/DCAN-Labs/abcd-dicom2bids/blob/audit-dev/src/audit/tier1_audit.py
 from src.utilities import (
-    DICOM2BIDS, dict_has, get_sub_ses_df_from_tier1, 
-    get_tier1_or_tier2_ERI_db_fname, HCPIPELINE, PATH_DICOM_DB,
-    PATH_NGDR, query_split_by_anat, query_processed_subjects,
+    DICOM2BIDS, dict_has, get_ERI_filepath, get_sub_ses_df_from_tier1, 
+    get_tier1_or_tier2_ERI_db_fname, BIDSPIPELINE, PATH_ABCD_BIDS_DB, 
+    PATH_DICOM_DB, PATH_NGDR, query_split_by_anat, query_processed_subjects,
     query_has_anat, query_unprocessed_subjects, save_to_hash_map_table,
     valid_output_dir, valid_readable_dir, valid_readable_file,
 )
@@ -31,7 +32,7 @@ from src.utilities import (
 
 
 def main():
-    cli_args = _cli([DICOM2BIDS, HCPIPELINE])
+    cli_args = _cli([DICOM2BIDS, BIDSPIPELINE])
     subject_lists = dict()
     pd.set_option('display.max_columns', None)
 
@@ -39,17 +40,21 @@ def main():
     dicom_db = get_dicom_db(cli_args)
 
     # DICOM2BIDS FLOW
-    subject_lists[DICOM2BIDS] = audit_abcd_dicom2bids(dicom_db, cli_args)
+    if DICOM2BIDS in cli_args["audit_type"]:
+        subject_lists[DICOM2BIDS] = audit_abcd_dicom2bids(dicom_db, cli_args)
 
-    """ 
     # ABCD-HCP FLOW
-    abcd_hcp_db = get_abcd_hcp_db(cli_args)
-    subject_lists[HCPIPELINE] = audit_abcd_hcp_pipeline(abcd_hcp_db, cli_args)
+    # abcd_bids_db = pd.read_csv(cli_args["pipeline_db"]) # get_abcd_hcp_db(cli_args)
+    if BIDSPIPELINE in cli_args["audit_type"]:
+        subject_lists[BIDSPIPELINE] = audit_abcd_bids_pipeline(cli_args)
 
     # AUDIT COUNT TABLE FLOW
+    # TODO
     if cli_args["show_counts"]:
-        assert len(cli_args["audit_type"]) > 1
-    """ # TODO
+        # assert len(cli_args["audit_type"]) > 1
+        # TODO Do this for both DICOM2BIDS and BIDSPIPELINE
+        for audit_type in cli_args["audit_type"]:
+            audit_count_table(cli_args, subject_lists[audit_type], audit_type)
 
 
     # DICOM DB FLOW
@@ -70,21 +75,25 @@ def main():
                 # Run s3_audit.py functions
 
 
-def update_w_sub_ses_ERI_counts(eri_db_fpath, pre_eri_db, non_ID_col_names):
-    db_ERI = pd.read_csv(eri_db_fpath)
-    pre_eri_db[get_ERI_col_name(eri_db_fpath)
-               ] = db_ERI[non_ID_col_names].apply(lambda row: row.count(), axis=1)
+def update_w_sub_ses_ERI_counts(db_ERI, col_ERI, pre_eri_db, non_ID_col_names):
+    pre_eri_db.loc[col_ERI] = db_ERI[non_ID_col_names].apply(lambda row: row.count(), axis=1)
     return pre_eri_db
 
 
-def audit_abcd_dicom2bids(dicom_db, cli_args):
+def get_sub_ses_cols_from(a_db_df):
+    """
+    :param a_db_df: pandas.DataFrame
+    :return: Tuple of 2 strings, the names of the subject and session columns
+    """
+    return a_db_df.columns.values[0], a_db_df.columns.values[1]
+
+
+def audit_abcd_dicom2bids(dicom_db, cli_args, counts=dict()):
     # DICOM2BIDS FLOW
     bids_columns = ["bids_subject_id", "bids_session_id"]
-    out_paths = dict()
 
-    sub_col = dicom_db.columns.values[0]  # "subject"
-    ses_col = dicom_db.columns.values[1]  # "session"
-    sessions=list(set(dicom_db[ses_col]))  # TODO Ensure that this gets the right column name (right now it's just "session")
+    sub_col, ses_col = get_sub_ses_cols_from(dicom_db)
+    sessions=list(set(dicom_db[ses_col]))
 
     # Trim down database to only include subjects that have a T1 or T2  # TODO make this comment accurate
     # Input: BIDS DB for that year
@@ -100,32 +109,42 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
     # Get all subject sessions that user already uploaded to the NDA
     # TODO Reorganize so that we count the NGDR statuses before checking uploads
     already_uploaded = list()
+    has_needed_ERI = dict()
     if dict_has(cli_args, "uploaded"):
         for each_csv_path in cli_args["uploaded"]:  
             already_uploaded.append(pd.read_csv(each_csv_path))
             assert already_uploaded[-1].columns.values.tolist() == bids_columns
         already_uploaded = pd.concat(already_uploaded)  # TODO Maybe we should make this a subset of the dicom_db
         uploaded_with_anat = pd.merge(dicom_db_with_anat, already_uploaded,
-                                    how="inner", left_on=[sub_col, ses_col],
-                                    right_on=bids_columns, indicator=True)
+                                      how="inner", left_on=[sub_col, ses_col],
+                                      right_on=bids_columns, indicator=True)
         # uploaded_with_anat = uploaded_with_anat[uploaded_with_anat["_merge"] == "right_only"]
         # non_ID_col_names = get_non_ID_col_names_from(uploaded_with_anat, sub_col, ses_col, *bids_columns)
         uploaded_with_anat.columns = [sub_col, ses_col, *bids_columns, *non_ID_col_names, "_merge"]
         # non_ID_col_names.remove("_merge")
 
     # For each year, check/count every subject-session's BIDS conversion status
-    counts = dict()
     ses_DBs = dict()
     sub_ses_df_BIDS_NGDR = get_sub_ses_df_from_tier1(PATH_NGDR, sub_col,
-                                                    ses_col)
+                                                     ses_col)
 
     # Count ERI files per subject session (TODO FIX & TEST)
-    # non_ID_cols = [col for col in dicom_db_with_anat.columns.values.tolist() if "task-"]
+    db_ERI = list() # dict()
     for eachfpath in cli_args["ERI_DB"]:
+        col_ERI = get_ERI_col_name(eachfpath)
+        db_ERI.append(pd.read_csv(eachfpath))  # [col_ERI]
         dicom_db_with_anat = update_w_sub_ses_ERI_counts(  # [get_ERI_col_name(eachfpath)]
-                                eachfpath, dicom_db_with_anat, non_ID_col_names
-                            )
+                                db_ERI[-1], col_ERI, dicom_db_with_anat, non_ID_col_names
+                             )
 
+    combined_ERI_db = db_ERI[0].apply( # dicom_db_with_anat.apply(
+        lambda row: get_ERI_for_sub_ses(row, db_ERI[1], sub_col, ses_col), axis=1
+    )
+    task_cols = [col for col in dicom_db_with_anat.columns.values.tolist()
+                 if col[:5] == "task-"]
+
+    all_missing_ERI = list()
+    all_missing_ERI_paths = list()
     for session in sessions:
         counts[session] = dict()
         ses_DBs[session] = dict()
@@ -144,19 +163,34 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
                 uploaded_with_anat["session"] == session
             ]  # TODO We also want the opposite of this (subject-sessions with anat that have not been uploaded) and, of those, how many succeeded BIDS conversion
 
-        for eachfpath in cli_args["ERI_DB"]:
-            col_ERI = get_ERI_col_name(eachfpath)
-            ses_DBs[session][col_ERI] = session_db[session_db[col_ERI] > 0]
-            # print(ses_DBs[session][col_ERI])
-
-        # TODO If user provided list of previously-uploaded subject-sessions, 
-        #      remove each one from this uploads_subject_list
-        # Build paths to .csv files to write subject/session lists into
-        out_paths["uploads_subject_list_" + session] = os.path.join(
-            cli_args["output"],
-            "{}" + "_{}_{}_subject-list.csv".format(DICOM2BIDS, session)
+        # Check how many subjects should have ERI, but don't
+        before_check = datetime.now()
+        has_needed_ERI[session] = ses_DBs[session]["Total"].apply(
+            lambda row: check_whether_sub_ses_has_ERI(row, combined_ERI_db,
+                                                      sub_col, ses_col,
+                                                      task_cols), axis=1
         )
+        if cli_args["verbose"]:
+            
+            print("Took {} to check whether every sub has ERI for ses {}"
+                  .format(datetime.now() - before_check, session))           
+        has_needed_ERI_col = has_needed_ERI[session].apply(lambda row: all([
+                is_truthy(row.get(col)) for col in task_cols
+            ]), axis=1)
+        ses_DBs[session]["Has-All-ERI"] = ses_DBs[session]["Total"][has_needed_ERI_col]
+        ses_DBs[session]["Missing-ERI"] = ses_DBs[session]["Total"][~has_needed_ERI_col]
 
+        # Identify which subject session task runs specifically have missing ERI
+        all_missing_ERI.append(ses_DBs[session]["Missing-ERI"].apply(lambda row:
+            get_all_task_runs_w_missing_ERI(row, has_needed_ERI[session],
+                                            sub_col, ses_col), axis=1
+        ))
+        if cli_args["verbose"]:
+            print("Missing ERI subject info:\n{}".format(all_missing_ERI[-1][0:3]))
+        if not all_missing_ERI[-1].empty:
+            all_missing_ERI_paths.append(  # Add this session's missing ERI to total
+                all_missing_ERI[-1].apply(get_all_missing_ERI_paths_for)
+            )
 
         # For subjects who succeeded with anat, check which made it to the NGDR
         ses_DBs[session]["NGDR"] = pd.merge(
@@ -169,25 +203,8 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
         ) 
 
         # Count how many subjects succeeded vs. failed BIDS conversion
-        print()
         for convert_status in ses_DBs[session].keys():
             counts[session][convert_status] = len(ses_DBs[session][convert_status])
-            print("{} subjects in {}{}: {}"  # TODO Move the "print" functionality to audit count table flow section
-                  .format(convert_status, session,
-                          "" if convert_status[:2].lower() == "no" else " with anat",
-                          counts[session][convert_status]))
-
-            # Save lists of subject-sessions (1 per conversion status)
-            ses_DBs[session][convert_status].to_csv(
-                out_paths["uploads_subject_list_" + session
-                          ].format(convert_status.replace(" ", "_")),
-                columns=[sub_col, ses_col], index=False, header=bids_columns
-            )
-
-        for eachfpath in cli_args["ERI_DB"]:
-            col_ERI = get_ERI_col_name(eachfpath)
-            print("Total number of ERI files for {} from {}: {}"
-                  .format(session, col_ERI, session_db[col_ERI].sum()))
 
         # For each subject-session,
         
@@ -200,11 +217,58 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
                 # Verify that the subject-session exists on the NGDR space
                 # Input: NGDR space path(s) where subject-sessions should exist, list of subject-sessions
                 # Output: List of subjects to move to the NGDR space, which needs to be a text file mapping (for each subject-session) s3 bucket paths to NGDR paths (one mapping per line, 2 space-separated paths)
-        
+    # with open(os.path.join(cli_args["output"], "all_missing_ERI_paths.txt"), "w+") as outfile:
+    #     outfile.write("\n".join(all_missing_ERI_paths))
+    
+    # Save lists of missing ERI to .csv files
+    pd.concat(all_missing_ERI).to_csv(os.path.join(
+            cli_args["output"], "all_missing_ERI_sub-ses-task-runs.csv"
+        ), index=False, header=False)
+    pd.concat(all_missing_ERI_paths).to_csv(os.path.join(
+            cli_args["output"], "all_missing_ERI_paths_sub-ses-task-runs.csv"
+        ), index=False, header=False)
+
+    # Save a DB of every convert status into its own .csv file
+    if cli_args["save_lists"]:
+        all_sessions = dict()
+        uploads_subject_list_outfpath = os.path.join(
+            cli_args["output"], "sub-ses-list_{}_{{}}.csv".format(DICOM2BIDS)
+        )
+        for convert_status in ses_DBs[session].keys():
+        # TODO If user provided list of previously-uploaded subject-sessions, 
+        #      remove each subject session from this uploads_subject_list
+            all_sessions[convert_status] = pd.concat([
+                ses_DBs[ses][convert_status] for ses in sessions
+            ])
+            all_sessions[convert_status].to_csv( 
+                uploads_subject_list_outfpath.format(
+                    convert_status.replace(" ", "_")
+                ), columns=[sub_col, ses_col], index=False, header=bids_columns
+            )
+
+    # Save out .csv file with the following columns; the .csv will help for rerunning abcd-dicom2bids:
+    # 1. Subject ID
+    # 2. Session
+    # 3. Number of task runs that this subject session is missing ERI files for
+    # 4. Total number of task runs for this subject session
+    counts_ERI = all_sessions["Missing-ERI"][[sub_col, ses_col]].copy() # pd.DataFrame(index=all_sessions["Missing-ERI"].index)
+    counts_ERI["Present"] = all_sessions["Missing-ERI"].apply(
+        lambda row: count_ERI_paths_in(row, combined_ERI_db, sub_col, ses_col, task_cols), axis=1
+    )
+    counts_ERI["Missing"] = all_sessions["Missing-ERI"].apply(
+        lambda row: count_Falses_in(row, has_needed_ERI, sub_col, ses_col, task_cols), axis=1
+    )
+    counts_ERI["Total"] = counts_ERI["Present"] + counts_ERI["Missing"]
+    print("Total ERI files per subject:\n{}".format(counts_ERI["Total"].iloc[0:5]))
+    counts_ERI.to_csv(os.path.join(cli_args["output"],
+                                   "sub-ses_missing-ERI-counts.csv"),
+                      columns=[sub_col, ses_col, "Missing", "Total"],
+                      index=False)
+
     need_to_copy_to_NGDR = pd.concat([ses_DBs[session]["Not yet NGDR"] for session in sessions])
     outfpath = os.path.join(cli_args["output"], "bids2ngdr_paths_hash_mapping.txt")
     save_to_hash_map_table(need_to_copy_to_NGDR, sub_col, ses_col,
-                           cli_args["bids_dir"], PATH_NGDR, outfpath)
+                           cli_args["bids_dir"], PATH_NGDR, outfpath)  # TODO Right now this lists each path twice, so ensure that bids_dir and PATH_NGDR are replaced with their correct (useful) values
 
             # Else (if subject that at least partly failed abcd-dicom2bids conversion),
 
@@ -213,6 +277,144 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
                 # Else
 
                     # Add subject to a list of failed subject-sessions to save out as a text file (1 subject-session per line)
+    return counts
+
+
+def count_Falses_in(row, has_ERI_dfs, sub_col, ses_col, task_cols):
+    ses = row.get(ses_col)
+    miss_row = get_ERI_row_for_sub_ses(row, has_ERI_dfs[ses], sub_col, ses_col)
+    miss_row_tasks = miss_row.get(task_cols)
+    return len(miss_row_tasks[miss_row_tasks == False])
+
+
+def count_ERI_paths_in(row, combined_ERI_db, sub_col, ses_col, task_cols):
+    row_w_ERI_paths = get_ERI_row_for_sub_ses(row, combined_ERI_db, sub_col, ses_col)
+    return row_w_ERI_paths.get(task_cols).count()
+
+
+def get_all_missing_ERI_paths_for(missing_ERI_list): #, combined_ERI_db, sub_col, ses_col):
+    result = list()
+    for task_run in missing_ERI_list[2:]:
+        result.append(get_ERI_filepath(
+            "", missing_ERI_list[0], missing_ERI_list[1],
+            *[x.split("-")[-1] for x in task_run.split("_")]
+        ))
+    return result
+
+
+def get_all_task_runs_w_missing_ERI(sub_ses_row, has_ERI_df, sub_col, ses_col):
+    has_ERI_row = get_ERI_row_for_sub_ses(sub_ses_row, has_ERI_df, sub_col, ses_col)
+    return [sub_ses_row.get(sub_col), sub_ses_row.get(ses_col),
+                     *has_ERI_row[has_ERI_row==False].index.values.tolist()] # ",".join(
+
+
+def audit_abcd_bids_pipeline(cli_args): 
+    counts = dict()
+
+    # Read in ABCD BIDS Pipeline Database from .csv file path given by user
+    pipeline_db = pd.read_csv(cli_args["pipeline_db"], index_col=0)
+
+    # Get pipeline DB column names
+    cols = dict()
+    cols["sub"], cols["ses"] = get_sub_ses_cols_from(pipeline_db)
+    sessions=list(set(pipeline_db[cols["ses"]]))
+    cols["struc"] = pipeline_db.columns.values[2]
+    cols["task_runs"] = pipeline_db.columns.values[3:]
+
+    # Pipeline DB Cell Values Guide: 
+    # For every stage/task-run in a subject session:
+    # - "ok" = Pipeline ran successfully; it made all expected outputs
+    # - "NO_ABCD-HCP" = the pipeline has not run yet
+    # - "failed" = the pipeline failed
+    # - "NO BIDS" = there are no BIDS inputs
+    # run_statuses = ["ok", "NO_ABCD-HCP", "failed", "NO BIDS"]
+    # run_statuses ={"Successes": "ok", "Not Yet Ran": "NO_ABCD-HCP", "Failures": "failed", "Unable to Run": "NO BIDS"}
+
+    ses_DBs = dict()
+    for session in sessions:
+        counts[session] = dict()
+        ses_DBs[session] = pipeline_db[pipeline_db[cols["ses"]] == session]
+        if cli_args["verbose"]:
+            print("Getting run statuses for session {}\n".format(session))
+        
+        ses_DBs[session]["Overall Status"] = ses_DBs[session].apply(
+            lambda row: get_overall_pipeline_status_of_sub_ses(row, cols),
+            axis=1
+        )
+        for run_status in ses_DBs[session]["Overall Status"].unique(): # run_statuses:
+            status_DB = ses_DBs[session][  # ses_DBs[session][run_status]
+                ses_DBs[session]["Overall Status"] == run_status
+            ]
+            counts[session][run_status] = len(status_DB)
+            # status_DB.to_csv(os.path.join(cli_args["output"], ""))
+
+    return counts
+
+
+def get_overall_pipeline_status_of_sub_ses(sub_ses_row, cols): # stage_col_names, sub_col, ses_col):
+    """
+    For a given row,
+    - If a row either has "ok" in every stage OR "ok" in structural and 
+      "NO BIDS" in every other stage, then return "Success"
+    - If a row has "NO_ABCD-HCP" in all stages, then return "Not Yet Run"
+    - If a row has "failed" anywhere, or is a mix of "ok" >1 time(s) and anything else, tell the user it failed
+    :param sub_ses_row: pandas.Series, 1 (subject session) row in pipeline_db
+    :param cols: Dictionary mapping the role of a column (or group of columns)
+                 to the actual name(s) of that column(s) in pipeline_db
+    :return: String, the overall status of a subject session row 
+    """
+    GOOD = "Success"
+    HASNT = "Not Yet Run"
+    FAIL = "Failure"
+    CANT = "Unable To Run"
+
+    # Get whether this subject session has structural data
+    struc_status = sub_ses_row.get(cols["struc"])
+    overall_status = {
+        "ok": GOOD, "NO_ABCD-HCP": HASNT, "failed": FAIL, "NO BIDS": CANT
+    }[struc_status]
+
+    # Check the status at each stage
+    ix = 0
+    while (overall_status not in (FAIL, CANT)) and ix < len(cols["task_runs"]):
+        overall_status = infer_overall_status_from(
+            sub_ses_row.get(cols["task_runs"][ix]),  # Status of each task run
+            overall_status, GOOD, HASNT, FAIL
+        )
+        ix += 1
+    # if struc_status != "ok": sys.exit("{}\n{}\n{}".format(sub_ses_row, struc_status, overall_status))
+    return overall_status
+
+
+def infer_overall_status_from(stage_status, overall_status, GOOD, HASNT, FAIL):
+    """
+    :param stage_status: String, value of a cell in a pipeline_db stage column
+    :param overall_status: String, a subject session row's overall status so
+                           far before accounting for stage_status
+    :param GOOD: String naming the success condition
+    :param HASNT: String naming the "hasn't been tried yet" condition 
+    :param FAIL: String naming the failure condition
+    :return: String, a subject session row's overall status so far after
+             accounting for stage_status
+    """
+    return consistent_xor_fail(overall_status, {  # NOTE This assumes that a mix of HASNT and GOOD is impossible
+        "ok": GOOD, "NO BIDS": GOOD, "NO_ABCD-HCP": HASNT, "failed": FAIL
+    }[stage_status], FAIL)
+
+
+def consistent_xor_fail(overall_status, success, failure):
+    """
+    Return either success if the stage status is consistent with the previous
+    overall status, or failure otherwise
+    :param overall_status: String, the overall status so far
+    :param success: String naming the success condition
+    :param failure: String naming the failure condition
+    :return: String, a stage's/task-run's status
+    """
+    return success if overall_status == success else failure 
+
+
+    # stage_statuses = [sub_ses_row.get(stage) for stage in stage_col_names]
 
 
     # ABCD-HCP FLOW
@@ -243,6 +445,7 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
             # Add subject-session to a triage list
 
 
+def audit_count_table(cli_args, counts, audit_type):
     # AUDIT COUNT TABLE FLOW (for Damien)
 
     # Finally, create a table with subject counts
@@ -254,15 +457,85 @@ def audit_abcd_dicom2bids(dicom_db, cli_args):
             # - succeeded thru pipeline AND are pulled to NGDR, AND are uploaded to the NDA
             # - need to be triaged
 
+    counts_df = pd.DataFrame(counts)
+    print(counts_df)
+    counts_df.to_csv(os.path.join(cli_args["output"],
+                                  "counts_{}.csv".format(audit_type)),
+                     index=True, header=True)
+    """
+    print("{} subjects in {}{}: {}"  # TODO Move the "print" functionality to audit count table flow section
+            .format(convert_status, session,
+                    "" if convert_status[:2].lower() == "no" else " with anat",
+                    counts[session][convert_status]))
+    """
             # If pipeline == ABCD-HCP, then also add a row showing how many subjects in session
                 # - failed to file-map
 
 
 # More Utility Functions
-    
+
+
+# def expects_ERI(sub_ses_row, task_cols):
+#     sub_ses_row.apply()
+
+
+def check_whether_sub_ses_has_ERI(row, combined_ERI_DB, sub_col, ses_col, task_cols):
+    """
+    :param row: pandas.Series, a row of the bids_db
+    :param combined_ERI_DB: pandas.DataFrame which has tier 1 and 2 ERI paths
+    :param sub_col: String naming the column in combined_ERI_DB, and the label
+                    in row, which has the subject ID
+    :param ses_col: String naming the column in combined_ERI_DB, and the label
+                    in row, which has the session name
+    :param task_cols: List of strings, each naming the column in combined_ERI_DB
+                      (and label in row) for a given task run with ERI
+    :return: pandas.Series where each cell is True iff row has all of the ERI 
+             that it should have for that task-run column, or False otherwise
+    """
+    dummy_row_data = [row.get(sub_col), row.get(ses_col)
+                      ] + [True for _ in range(2, len(row.index))]
+    result = pd.Series(data=dummy_row_data, index=row.index)
+    for task_run, status in row.loc[task_cols].dropna().items():
+        if status[:4] == "bids":
+            row_ERI = get_ERI_row_for_sub_ses(row, combined_ERI_DB,
+                                              sub_col, ses_col)
+            result.loc[task_run] = is_truthy(row_ERI.get(task_run))
+    return result
+
+
+def get_ERI_for_sub_ses(row_ERI_DB_1, db_ERI_2, sub_col, ses_col):
+    """
+    :return: pandas.Series which replaced as many NaN values as it could in
+             row_ERI_DB_1 with values from the same column/row in db_ERI_2.
+    """
+    return row_ERI_DB_1.combine_first(get_ERI_row_for_sub_ses(
+        row_ERI_DB_1, db_ERI_2, sub_col, ses_col
+    ))
+
+
+def get_ERI_row_for_sub_ses(orig_row, db_ERI, sub_col, ses_col):
+    """
+    :return: pandas.Series, the row of db_ERI with the same subject and
+             session as orig_row
+    """
+    return db_ERI[(db_ERI[sub_col] == orig_row.get(sub_col)) &
+                  (db_ERI[ses_col] == orig_row.get(ses_col))].iloc[0]
+
+
+def is_truthy(a_value):
+    result = bool(a_value)
+    # if not a_value:
+    #     result = False
+    if result and isinstance(a_value, float):
+        result = not np.isnan(a_value)
+    return result  # False if not a_value else (not np.isnan(a_value))
+
 
 def _cli(audit_names): 
+    # audits = [audit.split("abcd-")[-1] for audit in audit_names]
     parser = argparse.ArgumentParser()
+    msg_csv_files = ("One or more paths to existing readable .csv files which each "
+                     "contain a list of subject-session pairs that ")
     msg_valid_path = " Must be a valid path to an existing local directory or s3 bucket."
     
     parser.add_argument(
@@ -330,9 +603,23 @@ def _cli(audit_names):
     parser.add_argument(
         "-uploaded", "--already-uploaded", dest="uploaded",
         nargs="+", type=valid_readable_file,
-        help=("One or more paths to existing readable .csv files which each "
-              "contain a list of subject-session pairs that were already "
-              "uploaded to the NDA.")
+        help=msg_csv_files + "were already uploaded to the NDA."
+    )
+
+    parser.add_argument(
+        "-pldb", "--pipeline-db", "--abcd-bids-db", "--abcd-bids-pipeline-db",
+        dest="pipeline_db", nargs="+", type=valid_readable_file,
+        default=PATH_ABCD_BIDS_DB,
+        help=msg_csv_files + ("are BIDS-formatted and ready to be processed "
+                              "through the ABCD BIDS Pipeline (with statuses "
+                              "on processing for all the stages).")
+    )
+
+    parser.add_argument(
+        "-save", "--save-lists", "--save-sub-ses-lists",
+        action="store_true", dest="save_lists",
+        help=("Include this flag to save out all subject-session lists as "
+              ".csv files in the --output directory.")
     )
 
     parser.add_argument(

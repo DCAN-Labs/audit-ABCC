@@ -3,7 +3,7 @@
 """
 Utilities for ABCC auditing workflow
 Originally written by Anders Perrone
-Updated by Greg Conan on 2022-08-10
+Updated by Greg Conan on 2022-09-27
 """
 import argparse
 import pandas as pd
@@ -14,7 +14,8 @@ import os
 
 # Constants: Pipeline names, database path, & temporarily hardcoded dirpath
 DICOM2BIDS = "abcd-dicom2bids"
-HCPIPELINE = "abcd-hcp-pipeline"
+BIDSPIPELINE = "abcd-bids-pipeline"
+PATH_ABCD_BIDS_DB = "/home/rando149/shared/projects/ABCC_year2_processing/s3_status_report.csv"
 PATH_DICOM_DB = "/home/rando149/shared/code/internal/utilities/abcd-dicom2bids/src/audit/ABCD_BIDS_db.csv"
 PATH_NGDR = "/spaces/ngdr/ref-data/abcd/nda-3165-2020-09/"
 
@@ -30,6 +31,21 @@ def dict_has(a_dict, a_key):
     :return: True if and only if a_key is mapped to something truthy in a_dict
     """
     return a_key in a_dict and a_dict[a_key]
+
+
+def get_ERI_filepath(parent, subj_ID, session, task, run):
+    """
+    :param parent: String, valid path to tier1 directory (e.g.
+                   "/home/nda-3165-2020-09/") or s3 bucket (e.g. "s3://bucket")
+    :param subj_ID: String naming a subject ID
+    :param session: String naming a session
+    :param task: String naming a task
+    :param run: Int or string, the run number
+    :return: String, valid path to an EventRelatedInformation.txt file
+    """
+    return os.path.join(parent, "sourcedata", subj_ID, session, "func",
+                        f"{subj_ID}_{session}_task-{task}_run-{run}_bold_"
+                        "EventRelatedInformation.txt")
 
 
 def get_tier1_or_tier2_ERI_db_fname(parent_dir, tier):

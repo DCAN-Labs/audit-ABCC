@@ -4,7 +4,7 @@
 ABCC Audit Main Script 
 Greg Conan: gconan@umn.edu
 Created 2022-07-06
-Updated 2022-09-28
+Updated 2022-10-19
 """
 # Standard imports
 import argparse
@@ -20,11 +20,12 @@ import sys
 #import s3_audit as s3  # TODO import from https://github.com/DCAN-Labs/abcd-dicom2bids/blob/audit-dev/src/audit/s3_audit.py
 #import tier1_audit as tier1   # TODO import from https://github.com/DCAN-Labs/abcd-dicom2bids/blob/audit-dev/src/audit/tier1_audit.py
 from src.utilities import (
-    DICOM2BIDS, dict_has, get_ERI_filepath, get_sub_ses_df_from_tier1, 
-    get_tier1_or_tier2_ERI_db_fname, BIDSPIPELINE, PATH_ABCD_BIDS_DB, 
-    PATH_DICOM_DB, PATH_NGDR, query_split_by_anat, query_processed_subjects,
-    query_has_anat, query_unprocessed_subjects, save_to_hash_map_table,
-    valid_output_dir, valid_readable_dir, valid_readable_file,
+    DICOM2BIDS, get_ERI_filepath, get_sub_ses_df_from_tier1, 
+    get_tier1_or_tier2_ERI_db_fname, BIDS_COLUMNS, BIDSPIPELINE,
+    PATH_ABCD_BIDS_DB, PATH_DICOM_DB, PATH_NGDR, query_split_by_anat,
+    query_processed_subjects, query_has_anat, query_unprocessed_subjects,
+    save_to_hash_map_table, valid_output_dir, valid_readable_dir,
+    valid_readable_file,
 )
 
 
@@ -90,8 +91,6 @@ def get_sub_ses_cols_from(a_db_df):
 
 def audit_abcd_dicom2bids(dicom_db, cli_args, counts=dict()):
     # DICOM2BIDS FLOW
-    bids_columns = ["bids_subject_id", "bids_session_id"]
-
     sub_col, ses_col = get_sub_ses_cols_from(dicom_db)
     sessions=list(set(dicom_db[ses_col]))
 
@@ -102,7 +101,7 @@ def audit_abcd_dicom2bids(dicom_db, cli_args, counts=dict()):
 
     # Get names of every column without identifying information or ERI counts
     non_ID_col_names = get_non_ID_col_names_from(
-        dicom_db_with_anat, sub_col, ses_col, *bids_columns,
+        dicom_db_with_anat, sub_col, ses_col, *BIDS_COLUMNS,
         *[get_ERI_col_name(fpath) for fpath in cli_args["ERI_DB"]]
     )
 
@@ -110,17 +109,18 @@ def audit_abcd_dicom2bids(dicom_db, cli_args, counts=dict()):
     # TODO Reorganize so that we count the NGDR statuses before checking uploads
     already_uploaded = list()
     has_needed_ERI = dict()
-    if dict_has(cli_args, "uploaded"):
+    if cli_args.get("uploaded"):
         for each_csv_path in cli_args["uploaded"]:  
             already_uploaded.append(pd.read_csv(each_csv_path))
-            assert already_uploaded[-1].columns.values.tolist() == bids_columns
+            assert tuple(already_uploaded[-1].columns.values.tolist()
+                         ) == BIDS_COLUMNS
         already_uploaded = pd.concat(already_uploaded)  # TODO Maybe we should make this a subset of the dicom_db
         uploaded_with_anat = pd.merge(dicom_db_with_anat, already_uploaded,
                                       how="inner", left_on=[sub_col, ses_col],
-                                      right_on=bids_columns, indicator=True)
+                                      right_on=BIDS_COLUMNS, indicator=True)
         # uploaded_with_anat = uploaded_with_anat[uploaded_with_anat["_merge"] == "right_only"]
         # non_ID_col_names = get_non_ID_col_names_from(uploaded_with_anat, sub_col, ses_col, *bids_columns)
-        uploaded_with_anat.columns = [sub_col, ses_col, *bids_columns, *non_ID_col_names, "_merge"]
+        uploaded_with_anat.columns = [sub_col, ses_col, *BIDS_COLUMNS, *non_ID_col_names, "_merge"]
         # non_ID_col_names.remove("_merge")
 
     # For each year, check/count every subject-session's BIDS conversion status
@@ -186,7 +186,8 @@ def audit_abcd_dicom2bids(dicom_db, cli_args, counts=dict()):
                                             sub_col, ses_col), axis=1
         ))
         if cli_args["verbose"]:
-            print("Missing ERI subject info:\n{}".format(all_missing_ERI[-1][0:3]))
+            print("{} subjects are missing ERI."
+                  .format(len(all_missing_ERI[-1].index)))
         if not all_missing_ERI[-1].empty:
             all_missing_ERI_paths.append(  # Add this session's missing ERI to total
                 all_missing_ERI[-1].apply(get_all_missing_ERI_paths_for)
@@ -228,23 +229,9 @@ def audit_abcd_dicom2bids(dicom_db, cli_args, counts=dict()):
             cli_args["output"], "all_missing_ERI_paths_sub-ses-task-runs.csv"
         ), index=False, header=False)
 
-    # Save a DB of every convert status into its own .csv file
-    if cli_args["save_lists"]:
-        all_sessions = dict()
-        uploads_subject_list_outfpath = os.path.join(
-            cli_args["output"], "sub-ses-list_{}_{{}}.csv".format(DICOM2BIDS)
-        )
-        for convert_status in ses_DBs[session].keys():
-        # TODO If user provided list of previously-uploaded subject-sessions, 
-        #      remove each subject session from this uploads_subject_list
-            all_sessions[convert_status] = pd.concat([
-                ses_DBs[ses][convert_status] for ses in sessions
-            ])
-            all_sessions[convert_status].to_csv( 
-                uploads_subject_list_outfpath.format(
-                    convert_status.replace(" ", "_")
-                ), columns=[sub_col, ses_col], index=False, header=bids_columns
-            )
+    all_sessions = save_run_status_subj_lists(
+        sessions, ses_DBs, [sub_col, ses_col], BIDS_COLUMNS, DICOM2BIDS, cli_args
+    )
 
     # Save out .csv file with the following columns; the .csv will help for rerunning abcd-dicom2bids:
     # 1. Subject ID
@@ -261,7 +248,7 @@ def audit_abcd_dicom2bids(dicom_db, cli_args, counts=dict()):
     counts_ERI["Total"] = counts_ERI["Present"] + counts_ERI["Missing"]
     print("Total ERI files per subject:\n{}".format(counts_ERI["Total"].iloc[0:5]))
     counts_ERI.to_csv(os.path.join(cli_args["output"],
-                                   "sub-ses_missing-ERI-counts.csv"),
+                                   "sub-ses-missing-ERI-counts.csv"),
                       columns=[sub_col, ses_col, "Missing", "Total"],
                       index=False)
 
@@ -316,7 +303,8 @@ def audit_abcd_bids_pipeline(cli_args):
 
     # Get pipeline DB column names
     cols = dict()
-    cols["sub"], cols["ses"] = get_sub_ses_cols_from(pipeline_db)
+    sub_ses_cols = get_sub_ses_cols_from(pipeline_db)
+    cols["sub"], cols["ses"] = sub_ses_cols
     sessions=list(set(pipeline_db[cols["ses"]]))
     cols["struc"] = pipeline_db.columns.values[2]
     cols["task_runs"] = pipeline_db.columns.values[3:]
@@ -331,9 +319,11 @@ def audit_abcd_bids_pipeline(cli_args):
     # run_statuses ={"Successes": "ok", "Not Yet Ran": "NO_ABCD-HCP", "Failures": "failed", "Unable to Run": "NO BIDS"}
 
     ses_DBs = dict()
+    status_DBs = dict()
     for session in sessions:
         counts[session] = dict()
         ses_DBs[session] = pipeline_db[pipeline_db[cols["ses"]] == session]
+        status_DBs[session] = dict()
         if cli_args["verbose"]:
             print("Getting run statuses for session {}\n".format(session))
         
@@ -342,13 +332,48 @@ def audit_abcd_bids_pipeline(cli_args):
             axis=1
         )
         for run_status in ses_DBs[session]["Overall Status"].unique(): # run_statuses:
-            status_DB = ses_DBs[session][  # ses_DBs[session][run_status]
+            status_DBs[session][run_status] = ses_DBs[session][  # ses_DBs[session][run_status]
                 ses_DBs[session]["Overall Status"] == run_status
             ]
-            counts[session][run_status] = len(status_DB)
-            # status_DB.to_csv(os.path.join(cli_args["output"], ""))
+            counts[session][run_status] = len(status_DBs[session][run_status])
+
+    # Save out .csv subj lists of pipeline successes, failures, etc.
+    save_run_status_subj_lists(
+        sessions, status_DBs, sub_ses_cols, BIDS_COLUMNS, BIDSPIPELINE, cli_args
+    )
 
     return counts
+
+
+def save_run_status_subj_lists(sessions, ses_DBs, cols, header,
+                               script_name, cli_args):
+    """
+    Save a DB of every convert status into its own .csv file 
+    :param sessions: List of strings, each naming a session
+    :param ses_DBs: _type_, _description_
+    :param cols: List/tuple with 2 strings: subject and session column names
+    :param header: _type_, _description_
+    :param script_name: _type_, _description_
+    :param cli_args: _type_, _description_
+    :return: _type_, _description_
+    """
+    all_sessions_status = dict()
+    if cli_args["save_lists"]:
+        uploads_subject_list_outfpath = os.path.join(
+            cli_args["output"], "sub-ses-list_{}_{{}}.csv".format(script_name)
+        )
+        for convert_status in ses_DBs[sessions[0]].keys():
+        # TODO If user provided list of previously-uploaded subject-sessions, 
+        #      remove each subject session from this uploads_subject_list
+            all_sessions_status[convert_status] = pd.concat([
+                ses_DBs[ses][convert_status] for ses in sessions
+            ])
+            all_sessions_status[convert_status].to_csv( 
+                uploads_subject_list_outfpath.format(
+                    convert_status.replace(" ", "-")
+                ), columns=cols, index=False, header=header
+            )
+    return all_sessions_status
 
 
 def get_overall_pipeline_status_of_sub_ses(sub_ses_row, cols): # stage_col_names, sub_col, ses_col):

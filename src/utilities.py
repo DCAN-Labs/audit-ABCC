@@ -3,7 +3,7 @@
 """
 Utilities for ABCC auditing workflow
 Originally written by Anders Perrone
-Updated by Greg Conan on 2022-09-27
+Updated by Greg Conan on 2022-10-20
 """
 import argparse
 import pandas as pd
@@ -13,8 +13,9 @@ import numpy as np
 import os
 
 # Constants: Pipeline names, database path, & temporarily hardcoded dirpath
-DICOM2BIDS = "abcd-dicom2bids"
+BIDS_COLUMNS = ("bids_subject_id", "bids_session_id")
 BIDSPIPELINE = "abcd-bids-pipeline"
+DICOM2BIDS = "abcd-dicom2bids"
 PATH_ABCD_BIDS_DB = "/home/rando149/shared/projects/ABCC_year2_processing/s3_status_report.csv"
 PATH_DICOM_DB = "/home/rando149/shared/code/internal/utilities/abcd-dicom2bids/src/audit/ABCD_BIDS_db.csv"
 PATH_NGDR = "/spaces/ngdr/ref-data/abcd/nda-3165-2020-09/"
@@ -22,15 +23,6 @@ PATH_NGDR = "/spaces/ngdr/ref-data/abcd/nda-3165-2020-09/"
 
 def main():
     pd.set_option('display.max_columns', None)
-
-
-def dict_has(a_dict, a_key):
-    """
-    :param a_dict: Dictionary (any)
-    :param a_key: Object (any)
-    :return: True if and only if a_key is mapped to something truthy in a_dict
-    """
-    return a_key in a_dict and a_dict[a_key]
 
 
 def get_ERI_filepath(parent, subj_ID, session, task, run):

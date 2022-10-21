@@ -384,8 +384,12 @@ def get_and_validate_AWS_s3_credentials(cli_args, parser):
         for i in range(len(key_names)):
             aws_creds[key_names[i]] = aws_keys[i]
     else:
-        try: aws_creds = get_s3info()
-        except (sp.CalledProcessError, ValueError): pass
+        try:
+            aws_creds = get_s3info()
+            aws_keys = [aws_creds.get("access key"),
+                        aws_creds.get("secret key")]
+        except (sp.CalledProcessError, ValueError):
+            pass
     for each_key in key_names:
         if not aws_creds.get(each_key):
             aws_creds[each_key] = get_AWS_credential(each_key, cli_args)

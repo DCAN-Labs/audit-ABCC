@@ -2,8 +2,6 @@
 
 """
 AWS s3 ABCC Audit Script
-Last Updated by Anders Perrone 2022-06-30
-Last Updated by Greg Conan 2022-09-27
 """
 # Standard imports
 import argparse
@@ -16,7 +14,7 @@ import subprocess as sp
 import urllib.parse
 
 # Local custom imports
-from utilities import (get_ERI_filepath,
+from src.utilities import (get_ERI_filepath,
                        get_tier1_or_tier2_ERI_db_fname, PATH_DICOM_DB,
                        PATH_NGDR, valid_output_dir, valid_readable_dir)
 

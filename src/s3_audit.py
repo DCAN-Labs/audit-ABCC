@@ -305,7 +305,7 @@ def find_and_save_all_ERI_paths(cli_args, client):
     """
     # Local variables: BIDS DB DF and column names to check for ERI files of
     bids_db = pd.read_csv(cli_args["bids_db_file"])
-    cols = [c for c in bids_db.columns.values.tolist() if c[-6:-2] == "run-"] # c.split("_")[0][:5] == "task-" or c.split("_")[0][0] == "T"]
+    cols = [c for c in bids_db.columns.values.tolist() if "run-" in c] # c.split("_")[0][:5] == "task-" or c.split("_")[0][0] == "T"]
     bids_db[cols] = np.nan  # Clear out BIDS DB values; we only need rows/cols
 
     # Update DB with ERI paths on tier1/bids_db

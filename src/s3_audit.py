@@ -14,7 +14,7 @@ import subprocess as sp
 import urllib.parse
 
 # Local custom imports
-from src.utilities import (get_ERI_filepath,
+from utilities import (get_ERI_filepath,
                        get_tier1_or_tier2_ERI_db_fname, PATH_DICOM_DB,
                        PATH_NGDR, valid_output_dir, valid_readable_dir)
 
@@ -120,61 +120,27 @@ def s3_client(access_key, host, secret_key):
                                  aws_secret_access_key=secret_key)
     return client
 
-
-def s3_get_bids_subjects(client, bucketName, prefix=""):
-    # TODO Test that this function still works after my edits
-    paginator = client.get_paginator('list_objects_v2')
-    page_iterator = paginator.paginate(
-        Bucket=bucketName, Delimiter='/', Prefix=prefix, EncodingType='url',
-        ContinuationToken='', FetchOwner=False, StartAfter=''
-    )
-    page_sub_ses_ERI = list()
-    for page in page_iterator:
-        print(s3_get_objects(client, bucketName, prefix.split("/")[0]))
-        print(prefix)
-        new_objects = [item["Key"] for item in page["CommonPrefixes"]["Contents"]]
-        print("Added {}".format(new_objects[-1]))
-        page_sub_ses_ERI.extend(new_objects)
-        no_children = False
-    if no_children:
-        print(f"No children in {prefix}")
-    return page_sub_ses_ERI
-
-
-def s3_get_bids_sessions(client, bucketName, prefix):
-    """ 
+def s3_get_keys(client, bucketName, prefix, **kwargs):
+    """
     :param client: boto3.session.Session.client to access s3 buckets
     :param bucketName: String naming an accessible s3 bucket
-    :param host: String, URL path to AWS host
     :param prefix: String naming the (s3 equivalent of a) parent directory
-    :return: List of strings, the names of all sessions w/ data matching prefixs
-    """  # TODO Test that this still works after my edits
-    s3_data = s3_get_objects(client, bucketName, prefix,
-                             Delimiter='/', MaxKeys=1000)
-    bids_sessions = [item['Prefix'].split('/')[1] for item in s3_data['CommonPrefixes'] if 'ses' in item['Prefix'].split('/')[1]]
-    return bids_sessions
-
-
-def s3_get_bids_anats(s3_data):  # TODO Test that this still works after my edits
+    :return: List of s3 file objects fetched via list_objects_v2
+    """
     try:
-        anats_T = dict()
-        for t in range(1, 3):
-            anats_T[t] = list()
-        for obj in s3_data['Contents']:
-            key = obj['Key']
-            for t in range(1, 3):
-                if key.endswith(f"_T{t}w.nii.gz"):
-                    anats_T[t].append(key)
-        all_anats = list()
-        for t in range(1, 3):
-            for i in range(0, len(anats_T[t])):
-                all_anats.append("T{}_run-0{}".format(t, i+1))
+        s3_data = list()
+        paginator = client.get_paginator('list_objects_v2')
+        page_iterator = paginator.paginate(Bucket=bucketName, Prefix=prefix, Delimiter='/',
+                                           StartAfter='', ContinuationToken='',
+                                           EncodingType='url', FetchOwner=False,
+                                           **kwargs)
+        for page in page_iterator:
+            s3_data.extend(page["CommonPrefixes"])
     except KeyError:
-        all_anats = None
-    return all_anats
+        s3_data = None
+    return s3_data
 
-
-def s3_get_objects(client, bucketName, prefix, **kwargs):
+def s3_get_contents(client, bucketName, prefix, **kwargs):
     """
     :param client: boto3.session.Session.client to access s3 buckets
     :param bucketName: String naming an accessible s3 bucket
@@ -194,12 +160,56 @@ def s3_get_objects(client, bucketName, prefix, **kwargs):
         s3_data = None
     return s3_data
 
+def s3_get_bids_subjects(client, bucketName, prefix=''):
+    """ 
+    :param client: boto3.session.Session.client to access s3 buckets
+    :param bucketName: String naming an accessible s3 bucket
+    :param host: String, URL path to AWS host
+    :param prefix: String naming the (s3 equivalent of a) parent directory
+    :return: List of strings, the names of all sessions w/ data matching prefixs
+    """
+    print(f"Collecting all subjects in {bucketName}")
+    s3_data = s3_get_keys(client, bucketName, prefix)
+    subject_list = ['sub-'+item['Prefix'].split('sub-')[1].strip('/') for item in s3_data if 'sub-' in item['Prefix']]
+    print(f"  Found {len(subject_list)} subjects")
+    return subject_list
 
-def s3_get_bids_funcs(s3_data):  # TODO Test that this still works after my edits
+def s3_get_bids_sessions(client, bucketName, prefix):
+    """ 
+    :param client: boto3.session.Session.client to access s3 buckets
+    :param bucketName: String naming an accessible s3 bucket
+    :param host: String, URL path to AWS host
+    :param prefix: String naming the (s3 equivalent of a) parent directory
+    :return: List of strings, the names of all sessions w/ data matching prefixs
+    """
+    s3_data = s3_get_keys(client, bucketName, prefix)
+    bids_sessions = [item['Prefix'].split('/')[1] for item in s3_data if 'ses' in item['Prefix'].split('/')[1]]
+    return bids_sessions
+
+def s3_get_bids_anats(s3_data):
+    try:
+        anats_T = dict()
+        for t in range(1, 3):
+            anats_T[t] = list()
+        for obj in s3_data:
+            key = obj['Key']
+            for t in range(1, 3):
+                if key.endswith(f"_T{t}w.nii.gz"):
+                    anats_T[t].append(key)
+        all_anats = list()
+        for t in range(1, 3):
+            for i in range(0, len(anats_T[t])):
+                all_anats.append("T{}_run-0{}".format(t, i+1))
+    except KeyError:
+        all_anats = None
+    return all_anats
+
+
+def s3_get_bids_funcs(s3_data):
     suffix='_bold.nii.gz' # looking for functional nifti files
     try:
         funcs = []
-        for obj in s3_data['Contents']:
+        for obj in s3_data:
             key = obj['Key'] 
             if 'func' in key and key.endswith(suffix):
                 # figure out functional basename
@@ -219,7 +229,6 @@ def s3_get_bids_funcs(s3_data):  # TODO Test that this still works after my edit
     except KeyError:
         return
 
-
 def get_functional_basename_of(key, base):
     """
     :param key: String, the full name of a subject session file
@@ -232,46 +241,39 @@ def get_functional_basename_of(key, base):
         result=""
     return result
 
-
 def s3_get_anat_and_func_imgs(client, bucket, subject, session):
     print('Checking S3 for {} {}'.format(subject, session))
-    s3_data = s3_get_objects(client, bucket, "/".join([subject, session, ""]))
+    s3_data = s3_get_contents(client, bucket, "/".join([subject, session, ""]))
     return {"anat": s3_get_bids_anats(s3_data),
             "func": s3_get_bids_funcs(s3_data)}
 
+def s3_get_imgs(client, bucket, subject, session):
+    print('Checking S3 for {} {}'.format(subject, session))
+    s3_data = s3_get_contents(client, bucket, "/".join([subject, session, ""]))
+    return s3_get_bids_anats(s3_data) + s3_get_bids_funcs(s3_data)
 
-def validate_aws_keys_args(user_input, parser):
-    """
-    Raise error if the user did not give a valid AWS key pair
-    :param user_input: List which should have 2 strings, the first a valid
-                       AWS access key and the second a valid AWS secret key
-    :param parser: argparse.ArgumentParser to raise error if anything's wrong
-    :return: user_input, but only if user_input is a valid AWS key pair
-    """
-    err_msg = None
-    if len(user_input) != 2:
-        err_msg = ("Please give exactly two keys, your access key and "
-                    "your secret key (in that order).")  
-    elif len(user_input[0]) != 20: 
-        err_msg = "Your AWS access key must be 20 characters long."
-    elif len(user_input[1]) != 40:
-        err_msg = "Your AWS secret key must be 40 characters long."
-    if err_msg:
-        parser.error(err_msg)
-    return user_input
+def s3_get_subject_dict(subject, session, imgs, assign_to_header):
+    subject_dict = {'subject': subject, 'session': session}
+    for img in imgs:
+        subject_dict[img] = assign_to_header
+    return subject_dict
 
-
-def get_AWS_credential(cred_name, cli_args):
-    """
-    If AWS credential was a CLI arg, return it; otherwise prompt user for it 
-    :param cred_name: String naming which credential (username or password)
-    :param input_fn: Function to get the credential from the user
-    :param cli_args: Dictionary containing all command-line arguments from user
-    :return: String, user's NDA credential
-    """
-    return cli_args[cred_name] if cli_args.get(cred_name) else getpass(
-        "Enter your AWS S3 {}: ".format(cred_name)
-    )
+def create_s3_db():
+    s3_bids_db = pd.DataFrame(columns=['subject',
+                                        'session',
+                                        'T1_run-01',
+                                        'T2_run-01',
+                                        'task-rest_run-01',
+                                        'task-rest_run-02',
+                                        'task-rest_run-03',
+                                        'task-rest_run-04',
+                                        'task-MID_run-01',
+                                        'task-MID_run-02',
+                                        'task-SST_run-01',
+                                        'task-SST_run-02',
+                                        'task-nback_run-01',
+                                        'task-nback_run-02'])
+    
 
 
 def find_ERI_on_s3_for(row, client, bucket, mappings):
@@ -320,7 +322,7 @@ def find_and_save_all_ERI_paths(cli_args, client):
     for bucketName in cli_args["buckets"]:
         all_ERI_paths[bucketName] = list()
         all_objects[bucketName] = ["s3://{}/{}".format(bucketName, urllib.parse.unquote(obj["Key"])) for obj in
-                                   s3_get_objects(client, bucketName,
+                                   s3_get_contents(client, bucketName,
                                                   "sourcedata")]
         for each_ERI_URL in all_objects[bucketName]:
             fname = each_ERI_URL.rsplit("/", 1)[-1]
@@ -358,13 +360,42 @@ def find_ERI_on_tier1_for(bids_dir, row, cols):
     return result
 
 
-def s3_get_subject_dict(sub_ses_imgs, subject, session, assign_to_header):
-    subject_dict = {'subject': subject, 'session': session}
-    for img_type in sub_ses_imgs.keys():
-        for header in sub_ses_imgs[img_type]:
-            subject_dict[header] = assign_to_header
-    return subject_dict
 
+
+
+
+def validate_aws_keys_args(user_input, parser):
+    """
+    Raise error if the user did not give a valid AWS key pair
+    :param user_input: List which should have 2 strings, the first a valid
+                       AWS access key and the second a valid AWS secret key
+    :param parser: argparse.ArgumentParser to raise error if anything's wrong
+    :return: user_input, but only if user_input is a valid AWS key pair
+    """
+    err_msg = None
+    if len(user_input) != 2:
+        err_msg = ("Please give exactly two keys, your access key and "
+                    "your secret key (in that order).")  
+    elif len(user_input[0]) != 20: 
+        err_msg = "Your AWS access key must be 20 characters long."
+    elif len(user_input[1]) != 40:
+        err_msg = "Your AWS secret key must be 40 characters long."
+    if err_msg:
+        parser.error(err_msg)
+    return user_input
+
+
+def get_AWS_credential(cred_name, cli_args):
+    """
+    If AWS credential was a CLI arg, return it; otherwise prompt user for it 
+    :param cred_name: String naming which credential (username or password)
+    :param input_fn: Function to get the credential from the user
+    :param cli_args: Dictionary containing all command-line arguments from user
+    :return: String, user's NDA credential
+    """
+    return cli_args[cred_name] if cli_args.get(cred_name) else getpass(
+        "Enter your AWS S3 {}: ".format(cred_name)
+    )
 
 def get_and_validate_AWS_s3_credentials(cli_args, parser):
     """
@@ -402,8 +433,21 @@ def main():
     cli_args = vars(parser.parse_args())
     aws_creds = get_and_validate_AWS_s3_credentials(cli_args, parser)
 
-    # Get all ERI paths on MSI and s3, then save them into .csv files
     client = s3_client(aws_creds["access key"], cli_args["host"], aws_creds["secret key"])
+
+    bids_db = pd.read_csv(cli_args['bids_db_file'])
+
+    for bucket in cli_args['buckets']:
+        bids_subjects = s3_get_bids_subjects(client, cli_args["buckets"][0], prefix="")
+        for subject in bids_subjects:
+            bids_sessions = s3_get_bids_sessions(client, bucket, '/'.join([subject, '']))
+            for session in bids_sessions:
+                s3_get_anat_and_func_imgs(client, bucket, subject, session)
+                subject_db = bids_db[(bids_db['subject'] == subject) & (bids_db['session'] == session)]
+
+
+
+    # Get all ERI paths on MSI and s3, then save them into .csv files
     find_and_save_all_ERI_paths(cli_args, client)
 
 

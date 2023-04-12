@@ -258,6 +258,36 @@ def s3_get_subject_dict(subject, session, imgs, assign_to_header):
         subject_dict[img] = assign_to_header
     return subject_dict
 
+def update_db(cli_args, client):
+    bids_db = pd.read_csv(cli_args['bids_db_file'])
+    for bucket in cli_args['buckets']:
+        bids_subjects = s3_get_bids_subjects(client, cli_args["buckets"][0], prefix="")
+        for subject in bids_subjects:
+            bids_sessions = s3_get_bids_sessions(client, bucket, '/'.join([subject, '']))
+            for session in bids_sessions:
+                headers = s3_get_imgs(client, bucket, subject, session)
+                subject_db = bids_db[(bids_db['subject'] == subject) & (bids_db['session'] == session)]
+                if subject_db.empty:
+                    print('ERROR: Subject {}/{} in s3 not in fastqc spreadhseet'.format(subject, session))
+                    subject_dict = {'subject': subject, 'session': session}
+                    for header in headers:
+                        subject_dict[header] = 'delete (s3)'
+                    bids_db = bids_db.append(subject_dict, ignore_index=True)
+                elif len(subject_db) == 1:
+                    for header in headers:
+                        try:
+                            if (subject_db[header] == 'no bids').all():
+                                subject_db[header] = 'bids (s3)'
+                            elif (subject_db[header] == 'bids (tier1)').all():
+                                subject_db[header] = 'bids (tier1) (s3)'
+                        except:
+                            subject_db[header] = 'delete (s3)'
+                            bids_db[header] = np.nan
+                    bids_db.loc[(bids_db['subject'] == subject) & (bids_db['session'] == session)] = subject_db
+                else:
+                    print('ERROR: Multiple entries for {} {}'.format(subject, session))
+    bids_db.to_csv(cli_args['bids_db_file'], index=False)
+
 def create_s3_db():
     s3_bids_db = pd.DataFrame(columns=['subject',
                                         'session',
@@ -273,6 +303,7 @@ def create_s3_db():
                                         'task-SST_run-02',
                                         'task-nback_run-01',
                                         'task-nback_run-02'])
+    return s3_bids_db
     
 
 

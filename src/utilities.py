@@ -3,9 +3,10 @@
 """
 Utilities for ABCC auditing workflow
 Originally written by Anders Perrone
-Updated by Greg Conan on 2022-10-20
+Updated by Greg Conan on 2024-01-18
 """
 import argparse
+from datetime import datetime
 import pandas as pd
 from glob import glob
 import nibabel as nib
@@ -21,44 +22,56 @@ PATH_DICOM_DB = "/home/rando149/shared/code/internal/utilities/abcd-dicom2bids/s
 PATH_NGDR = "/spaces/ngdr/ref-data/abcd/nda-3165-2020-09/"
 
 
+class BareObject:
+    """
+    Any function which initalizes this empty object to use as a namespace will
+    be able to assign it arbitrary attributes as properties. Used inside other
+    class definitions when it is more intuitive than defining a dict.
+    """
+    pass
+
+
 def main():
     pd.set_option('display.max_columns', None)
 
 
-def get_ERI_filepath(parent, subj_ID, session, task, run):
+def get_and_print_time_if(will_print, event_time, event_name):
     """
-    :param parent: String, valid path to tier1 directory (e.g.
-                   "/home/nda-3165-2020-09/") or s3 bucket (e.g. "s3://bucket")
-    :param subj_ID: String naming a subject ID
-    :param session: String naming a session
-    :param task: String naming a task
-    :param run: Int or string, the run number
-    :return: String, valid path to an EventRelatedInformation.txt file
+    Print and return a string showing how much time has passed since the
+    current running script reached a certain part of its process
+    :param will_print: True to print an easily human-readable message
+                       showing how much time has passed since {event_time}
+                       when {event_name} happened, False to skip printing
+    :param event_time: datetime object representing a time in the past
+    :param event_name: String to print after 'Time elapsed '
+    :return: datetime object representing the current moment
     """
-    return os.path.join(parent, "sourcedata", subj_ID, session, "func",
-                        f"{subj_ID}_{session}_task-{task}_run-{run}_bold_"
-                        "EventRelatedInformation.txt")
+    timestamp = datetime.now()
+    if will_print:
+        print("\nTime elapsed {}: {}"
+              .format(event_name, timestamp - event_time))
+    return timestamp 
 
 
 def get_tier1_or_tier2_ERI_db_fname(parent_dir, tier):
     return os.path.join(parent_dir, "ERI_tier{}_paths_bids_db.csv".format(tier))
 
 
-def get_sub_ses_df_from_tier1(tier1_dirpath, sub_col, ses_col):
-    path_col = "tier1_dirpath"
+def get_variance_of_each_row_of(dtseries_path):
+    """
+    :param dtseries_path: String, valid path to existing dtseries.nii file
+    :return: np.ndarray of floats; each is the variance of a row in the dtseries file
+    """
+    return load_matrix_from(dtseries_path).var(axis=1)
 
-    # Get DF of all subjects and their sessions in the NGDR space
-    all_sub_ses_NGDR_paths = glob(os.path.join(tier1_dirpath, "sub-*", "ses-*"))
-    # NOTE Later we can verify specific files existing instead of just the
-    #      session directories existing
-    all_sub_ses_NGDR = pd.DataFrame({path_col: [path for path in all_sub_ses_NGDR_paths]})
-    all_sub_ses_NGDR[sub_col] = all_sub_ses_NGDR[path_col].apply(
-        lambda path: os.path.basename(os.path.dirname(path))
-    )
-    all_sub_ses_NGDR[ses_col] = all_sub_ses_NGDR[path_col].apply(
-        lambda path: os.path.basename(path)
-    )
-    return all_sub_ses_NGDR
+
+def is_truthy(a_value):
+    result = bool(a_value)
+    # if not a_value:
+    #     result = False
+    if result and isinstance(a_value, float):
+        result = not np.isnan(a_value)
+    return result  # False if not a_value else (not np.isnan(a_value))
 
 
 def load_matrix_from(matrix_path):
@@ -72,52 +85,19 @@ def load_matrix_from(matrix_path):
     }[os.path.splitext(matrix_path)[-1]](nib.load(matrix_path))
 
 
-def get_variance_of_each_row_of(dtseries_path):
+def make_ERI_filepath(parent, subj_ID, session, task, run):
     """
-    :param dtseries_path: String, valid path to existing dtseries.nii file
-    :return: np.ndarray of floats; each is the variance of a row in the dtseries file
+    :param parent: String, valid path to tier1 directory (e.g.
+                   "/home/nda-3165-2020-09/") or s3 bucket (e.g. "s3://bucket")
+    :param subj_ID: String naming a subject ID
+    :param session: String naming a session
+    :param task: String naming a task
+    :param run: Int or string, the run number
+    :return: String, valid path to an EventRelatedInformation.txt file
     """
-    return load_matrix_from(dtseries_path).var(axis=1)
-
-
-def query_has_anat(df):
-    """
-    Filter dataframe for subjects that have at least one anatomical
-    :param df: pandas.DataFrame
-    """
-    return df[~df.filter(regex='T[1,2].*').isin([np.nan]).all(axis=1)]
-
-
-def query_processed_subjects(df):
-    """
-    Filter dataframe to get dataframe of subjects that do not have any unprocessed images
-    """
-    processed_df = df[~df[df.columns[2:]].isin(['no bids']).any(axis=1)]
-    # Filter again to remove subjects that have need data deleted
-    fully_processed_df = processed_df[~processed_df.isin(['delete (tier1)', 'delete (s3)']).any(axis=1)]
-    # Filter again to remove subjects that do not have a T1
-    fully_processed_df = query_has_anat(fully_processed_df)
-    return fully_processed_df
-
-
-def query_split_by_anat(df):
-    """
-    Filter dataframe for subjects that have at least one anatomical
-    """
-    filter_cond = df.filter(regex='T[1,2].*').isin([np.nan]).all(axis=1)
-    return df[~filter_cond], df[filter_cond]
-    
-
-def query_unprocessed_subjects(df):
-    """
-    Check for fully unprocessed subjects
-    """
-    # Filter dataframe to get dataframe of subjects that are missing one or more modalities
-    missing_data_df = df[df[df.columns[2:]].isin(['no bids']).any(axis=1)]
-    # Filter again to remove subjects that have BIDS data somewhere
-    fully_unprocessed_df = missing_data_df[~missing_data_df.isin(['bids (tier1)', 'delete (tier1)', 'bids (s3)', 'delete (s3)']).any(axis=1)]
-    
-    return fully_unprocessed_df
+    return os.path.join(parent, "sourcedata", subj_ID, session, "func",
+                        f"{subj_ID}_{session}_task-{task}_run-{run}_bold_"
+                        "EventRelatedInformation.txt")
 
 
 def save_to_hash_map_table(sub_ses_df, subj_col, ses_col, in_dirpath,

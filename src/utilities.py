@@ -3,7 +3,7 @@
 """
 Utilities for ABCC auditing workflow
 Originally written by Anders Perrone
-Updated by Greg Conan on 2024-02-07
+Updated by Greg Conan on 2024-02-26
 """
 # Standard imports
 import argparse
@@ -11,26 +11,38 @@ from collections.abc import Callable, Hashable
 from datetime import datetime
 import functools
 from getpass import getpass
+from glob import glob
+import json
 import logging
 import os
 import pdb
 import re
 import subprocess as sp
 import sys
-from typing import (Any, Generator, Iterable, List, Mapping,
-                    Optional, Tuple, Union)  # Literal, 
-import urllib
+from typing import (Any, Dict, Generator, Iterable, List,  # Literal, 
+                    Mapping, Optional, Tuple, Union)
 
-# External imports
+# External (pip/PyPI) imports
 import boto3
 import nibabel as nib
 import numpy as np
 import pandas as pd
 
-# Constants: Pipeline names, database path, & temporarily hardcoded dirpath
+# Constants
+
+# Pipeline names, col names
 BIDS_COLUMNS = ("bids_subject_id", "bids_session_id")
 BIDSPIPELINE = "abcd-bids-pipeline"
 DICOM2BIDS = "abcd-dicom2bids"
+
+# Column names to split BIDS filename into for each data type (dtype)
+DTYPE_2_UNIQ_COLS = {"anat": ["rec-normalized", "run", "Tw"],
+                     "dwi":  ["run"],
+                     "fmap": ["acq", "dir", "run"],
+                     "func": ["task", "run"]}
+
+# Database path, data types definition fpath, temporarily hardcoded dirpath
+IMG_DSC_2_COL_HDR_FNAME = "image_description_to_header_col.json"
 LOGGER_NAME = "BidsDBLogger"
 PATH_ABCD_BIDS_DB = "/home/rando149/shared/projects/ABCC_year2_processing/s3_status_report.csv"
 PATH_DICOM_DB = "/home/rando149/shared/code/internal/utilities/abcd-dicom2bids/src/audit/ABCD_BIDS_db.csv"
@@ -39,55 +51,91 @@ SESSION_DICT = {'baseline_year_1_arm_1': 'ses-baselineYear1Arm1',
                 '2_year_follow_up_y_arm_1': 'ses-2YearFollowUpYArm1',
                 '4_year_follow_up_y_arm_1': 'ses-4YearFollowUpYArm1'}
 
-# Column names to split BIDS filename into for each data type (dtype)
-DTYPE_2_UNIQ_COLS = {"anat": ["rec-normalized", "run", "Tw"],
-                     "dwi":  ["run"],  # TODO is "dwi" needed?
-                     "fmap": ["acq", "dir", "run"],
-                     "func": ["task", "run"]}
+# Shorthand names for the different kinds of BIDS DBs
+WHICH_DBS = ("ftqc", "tier1", "s3")
 
 
 def main():
     pd.set_option('display.max_columns', None)
 
 
-def attrs_in(an_obj: Any):
+def attrs_in(an_obj: Any) -> List[str]:
+    """
+    :param an_obj: Any
+    :return: List of strings naming every public attribute in an_obj
+    """
     return uniqs_in([attr_name if not attr_name.startswith("_")
                      else None for attr_name in dir(an_obj)])
 
 
 def build_NGDR_fpath(root_BIDS_dir: str, parent_dirname: str,
                      which_BIDS_file: str) -> str:
+    """
+    :param root_BIDS_dir: str, valid path to existing top-level BIDS directory
+                          with "sub-*/ses-*/" subdirectories
+    :param parent_dirname: str naming the subdirectory of "sub-*/ses-*/" to
+                           get files from 
+    :param which_BIDS_file: str naming the files in parent_dirname to get
+    :return: str, (BIDS-)valid path to existing local files
+    """
     return os.path.join(root_BIDS_dir, "sub-*", "ses-*", parent_dirname,
                         f"sub-*_ses-*_{which_BIDS_file}")
 
 
 def boolify_and_clean_col(exploded_col: pd.Series) -> pd.Series:
+    """
+    :param exploded_col: pd.Series of strings, each element either the empty
+                         string or a certain other string
+    :return: pd.Series of bools, replacing the empty string with False and the
+             other string with True; that other string is now the Series name
+    """
     new_col = exploded_col != ""
     new_col.name = exploded_col[new_col].unique()[0]
     return new_col
+    
 
-
-def debug_or_raise(an_err: Exception, local_vars: Mapping[str, Any]) -> None:
+def build_summary_str(ftqc: bool, s3: bool, tier1: bool, **_: Any) -> str:
+    """ 
+    :param ftqc: True if a given file passed QC (ftq_usable == 1.0) else False
+    :param s3: True if a given file is present in an ABCC s3 bucket else False
+    :param tier1: True if a given file is present in NGDR on tier 1 else False
+    :return: String summarizing the given file's completeness
     """
-    :param an_err: Exception
-    :param local_vars: Dict<str:obj> mapping variables' names to their values;
-                       locals() called from where an_err originated
-    :raises an_err: if self.debug is False; otherwise pause to debug
+    return "".join(["goodQC" if ftqc else "badQC",
+                    " (s3)" if s3 else "",
+                    " (tier1)" if tier1 else ""])
+
+
+def df_is_nothing(df: Optional[pd.DataFrame] = None) -> bool:
     """
-    # vrs = LazyDict(local_vars)
-    if in_debug_mode():
-        locals().update(local_vars)
-        if verbosity_is_at_least(2):
-            logging.getLogger(LOGGER_NAME).exception(an_err)  # .__traceback__)
-        if verbosity_is_at_least(1):
-            show_keys_in(locals())  # , logging.getLogger(LOGGER_NAME).info)
-        pdb.set_trace()
-    else:
-        raise an_err
+    :param df: Object to check if it's nothing/empty/falsy
+    :return: True if df is None or empty; otherwise False
+    """
+    return (df is None or df.empty)
 
 
-def default_pop(poppable: Any, key:Optional[Any] = None,
-                default:Optional[Any] = None):
+def debug(an_err: Exception, local_vars: Mapping[str, Any]) -> None:
+    """
+    :param an_err: Exception (any)
+    :param local_vars: Dict[str, Any] mapping variables' names to their
+                       values; locals() called from where an_err originated
+    """
+    locals().update(local_vars)
+    if verbosity_is_at_least(2):
+        logging.getLogger(LOGGER_NAME).exception(an_err)  # .__traceback__)
+    if verbosity_is_at_least(1):
+        show_keys_in(locals())  # , logging.getLogger(LOGGER_NAME).info)
+    pdb.set_trace()
+
+
+def default_pop(poppable: Any, key: Optional[Any] = None,
+                default: Optional[Any] = None) -> Any:
+    """
+    :param poppable: Any object which implements the .pop() method
+    :param key: Input parameter for .pop(), or None to call with no parameters
+    :param default: Object to return if running .pop() raises an error
+    :return: Object popped from poppable.pop(key), if any; otherwise default
+    """
     try:
         if key is None:
             to_return = poppable.pop()
@@ -100,41 +148,6 @@ def default_pop(poppable: Any, key:Optional[Any] = None,
 
 def dt_format(moment: datetime) -> str:
     return moment.strftime("%Y-%m-%d_%H-%M-%S")
-
-    
-def fix_split_col(qc_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Because qc_df's ftq_notes column contains values with commas, it is split
-    into multiple columns on import. This function puts them back together.
-    :param qc_df: pandas.DataFrame with all QC data
-    :return: pandas.DataFrame which is qc_df, but with the last column(s) fixed
-    """
-    def trim_end_columns(row: pd.Series) -> None:
-        """
-        Local function to check for extra columns in a row, and fix them
-        :param row: pandas.Series which is one row in the QC DataFrame
-        :param columns: List of strings where each is the name of a column in
-        the QC DataFrame, in order
-        :return: N/A
-        """
-        ix = int(row.name)
-        if not pd.isna(qc_df.at[ix, columns[-1]]):
-            qc_df.at[ix, columns[-3]] += " " + qc_df.at[ix, columns[-2]]
-            qc_df.at[ix, columns[-2]] = qc_df.at[ix, columns[-1]]
-
-    # Keep checking and dropping the last column of qc_df until it's valid
-    columns = qc_df.columns.values.tolist()
-    last_col = columns[-1]
-    while any(qc_df[last_col].isna()):
-        qc_df.apply(trim_end_columns, axis="columns")
-        print("Dropping '{}' column because it has NaNs".format(last_col))
-        qc_df = qc_df.drop(last_col, axis="columns")
-        columns = qc_df.columns.values.tolist()
-        last_col = columns[-1]
-    return qc_df
-
-
-# TODO Is there a reason that s3_audit.py originally counted runs using range() (see s3_get_bids_anats) instead of just getting them from the file names like the funcs?
 
 
 def get_and_log_time_since(event_name, event_time):
@@ -169,17 +182,45 @@ def get_and_print_time_if(will_print: bool, event_time: datetime,
     return timestamp 
 
 
-def get_col_headers_for(dtype: str, df:Optional[pd.DataFrame] = None) -> set:
+def get_col_headers_for(dtype: str, df: Optional[pd.DataFrame] = None) -> set:
     # headers = set(headers) if headers else set()
     headers = set()
     prefix, uniq_col = get_header_vars_for(dtype)
-    if not is_nothing(df):
+    if not (df is None or df.empty): # not is_nothing(df):
         uniqs = df[uniq_col].unique()
         runs = df["run"].unique()
+        # pdb.set_trace()
         for run in runs:
             for uniq in uniqs:
                 headers.add(make_col_header(f"{prefix}{uniq}", run))
     return headers
+
+
+def get_most_recent_FTQC_fpath(incomplete_dirpath_FTQC):
+    # Get all readable abcd_fastqc01.txt file paths
+    ftqc_paths = pd.DataFrame({"fpath":
+                               glob(incomplete_dirpath_FTQC.format("*"))})
+    ftqc_paths["readable"] = ftqc_paths["fpath"].apply(
+        lambda fpath: os.access(fpath, os.R_OK)
+    )
+    # ftqc_paths.drop(index=~ftqc_paths["readable"], inplace=True)
+    ftqc_paths = ftqc_paths[ftqc_paths["readable"]]
+
+    # If there are no readable abcd_fastqc01.txt file paths, return None
+    if ftqc_paths.empty:
+        most_recent_FTQC = None
+    else:
+
+        # Get the datetimestamp (int) from each abcd_fastqc01.txt file name
+        prefix, suffix = incomplete_dirpath_FTQC.split("{}")
+        ftqc_paths["dtstamp"] = \
+            ftqc_paths["fpath"].str.strip(prefix).str.rstrip(suffix)
+        ftqc_paths["dtstamp"] = ftqc_paths["dtstamp"].astype(int)
+
+        # Return the path to the most recent abcd_fastqc01.txt file
+        most_recent_FTQC = \
+            ftqc_paths.loc[ftqc_paths["dtstamp"].idxmax(), "fpath"]
+    return most_recent_FTQC
 
 
 def get_ERI_filepath(bids_dir_path: str) -> str:
@@ -191,32 +232,9 @@ def get_ERI_filepath(bids_dir_path: str) -> str:
 def get_header_vars_for(dtype: str) -> Tuple[str]:
     return {"func":      ("task-", "task"),
             "anat":      ("T", "Tw"),
-            "fmap":      ("", "dir"),  # TODO "FM" for fmap?
+            "fmap":      ("FM-", "dir"),
             "dwi":       ("", "dtype") # "dtype" -> uniq_col with only 1 value
             }.get(dtype, ("", ""))
-
-
-def get_subj_ses_dict(subj_ses_QC_DF: pd.DataFrame) -> Mapping[str, Any]:
-    """
-    :param subj_ses_QC_DF: All df_QC rows for a specific subject and session,
-                           but no others. Passed in by DataFrameGroupBy.apply
-    :return: list<dict<str:obj>> to add as a row in a new pd.DataFrame
-    """
-    subject_dict = None  # Return value: None if session df is empty
-    pid = subj_ses_QC_DF.pGUID
-    ses = subj_ses_QC_DF.EventName
-    print(f'Checking {pid} {ses}')
-    if not subj_ses_QC_DF.empty:
-        ses_df_QC = subj_ses_QC_DF[subj_ses_QC_DF['QC'] == 1.0]
-        subject_dict = {'subject': reformat_pGUID(pid),
-                        'session': SESSION_DICT[ses]} 
-        for t in range(2):
-            subject_dict = ImageTypeIn(ses_df_QC, t, is_anat=True
-                                       ).add_own_run_counts_to(subject_dict)
-        for task in ("rest", "MID", "SST", "nback"):
-            subject_dict = ImageTypeIn(ses_df_QC, task, is_anat=False
-                                       ).add_own_run_counts_to(subject_dict)
-    return subject_dict
 
 
 def get_tier1_or_tier2_ERI_db_fname(parent_dir: str, tier: int) -> str:
@@ -231,46 +249,68 @@ def get_variance_of_each_row_of(dtseries_path: str):
     return load_matrix_from(dtseries_path).var(axis=1)
 
 
-def invert_dict(a_dict: dict) -> dict:
-    return {v: k for k, v in a_dict.items()}
+def invert_dict(a_dict: Dict[Hashable, Hashable],
+                keep_collision: bool = False) -> Dict[Hashable, Hashable]:
+    """
+    Switch a dict's keys and values.
+    If two keys mapped to the same value, then they will collide when the keys
+    and values are swapped: which key should be kept? Calling this function
+    with keep_collision will put the colliding old keys into sets.
+    Otherwise, the old value will only be mapped as a new key to 
+    whichever old key comes up last during iteration.
+    :param a_dict: Dictionary (any with hashable values)
+    :param keep_collision: True to keep old keys with the same value
+    :return: dict mapping old values (new keys) to old keys (new values).
+    """
+    if keep_collision:
+        new_dict = dict()
+        for k, v in a_dict.items():
+            if v in new_dict:
+                if isinstance(new_dict[v], set):
+                    new_dict[v].add(k)
+                else:
+                    new_dict[v] = {k, new_dict[v]}
+            else:
+                new_dict[v] = k
+    else:  # By default, simply set every value to a key and vice versa
+        new_dict = {v: k for k, v in a_dict.items()}
+    return new_dict
 
 
-class ImageTypeIn:
-    def __init__(self, ses_df: pd.DataFrame, which: str,
-                 is_anat: bool) -> None:
-        self.is_anat = is_anat
-        self.ses_df = ses_df
-        self.which = which
+class ImgDscColNameSwapper:  # (LazyDict): 
+    def __init__(self, json_fpath: Optional[str] = None) -> None:
+        self.fpath = self.find_fpath(json_fpath)
+        self.dsc2hdr = extract_from_json(self.fpath)
+        self.hdr2dsc = invert_dict(self.dsc2hdr,
+                                   keep_collision=True)
+        self.hdr2dsc.pop(None, None)
 
-    def count_own_rows(self) -> int:
-        # Count how many ses_df rows fit this DTypeCol's ses_df.image_description 
-        if self.is_anat:
-            img_dsc = f"ABCD-{self.which}"
-            df = self.get_rows_by_img_desc(f"{img_dsc}-NORM")
-            if df.empty:
-                df = self.get_rows_by_img_desc(img_dsc)
+        # Map each header column name and image_description to its dtype
+        self.dtype_of = LazyDict()
+        HDR_PFX_2_DTYPE = {"T1": "anat", "T2": "anat", "task": "func",
+                           "FM": "fmap", "dwi": "dwi"}
+        for dsc, hdr in self.dsc2hdr.items():
+            self.dtype_of[hdr] = (HDR_PFX_2_DTYPE.get(hdr.split("-", 1)[0], None)
+                                  if hdr else None)  # self.hdr_col_to_dtype(hdr)
+            self.dtype_of[dsc] = self.dtype_of[hdr]
+
+    def find_fpath(self, json_fpath: Optional[str] = None) -> str:
+        to_check = list()
+        if json_fpath:
+            fname, dir_to_check = os.path.split(json_fpath)
+            to_check = [dir_to_check]
         else:
-            swapper = TaskNames()
-            df = self.get_rows_by_img_desc(swapper.swap(self.which))
-        return df.drop_duplicates(subset='image_file', keep='first').shape[0]
-
-    def get_rows_by_img_desc(self, img_dsc: str) -> pd.DataFrame:
-        # Select own subset of the dataframe
-        return self.ses_df[self.ses_df["image_description"] == img_dsc]
-
-    def add_own_run_counts_to(self, subject_dict: dict) -> dict:
-        for run_num in range(0, self.count_own_rows()):
-            subject_dict[make_col_header(self.which, run_num + 1)] = 'no bids'
-        return subject_dict
-
-
-def is_truthy(a_value: Any) -> bool:
-    result = bool(a_value)
-    # if not a_value:
-    #     result = False
-    if result and isinstance(a_value, float):
-        result = not np.isnan(a_value)
-    return result  # False if not a_value else (not np.isnan(a_value))
+            fname = IMG_DSC_2_COL_HDR_FNAME
+            to_check = list()
+        to_check += [os.path.dirname(sys.argv[0]),
+                     os.path.dirname(__file__), os.getcwd()]
+        return search_for_readable_file(fname, *to_check)
+        
+    def to_header_col(self, image_description: str) -> str:
+        return self.dsc2hdr.get(image_description)
+    
+    def to_image_desc(self, header_col_name: str) -> str:
+        return self.hdr2dsc.get(header_col_name)
 
 
 def iter_attr(an_obj: Any) -> Generator[str, None, None]:
@@ -334,35 +374,9 @@ class LazyDict(dict):
                 self.setdefault(key, set_if_absent()))
 
 
-def in_debug_mode() -> bool:
-    """
-    :return: Boolean indicating whether or not the program is being run in
-             debug mode
-    """
-    return verbosity_is_at_least(2)  # TODO
-    """
-    try:
-        currently_in_debug_mode = DEBUG
-    except NameError as e:
-        if globals().get("DEBUG") is None:
-            show_keys_in(locals())
-            pdb.set_trace()
-        else:
-            currently_in_debug_mode = globals().get("DEBUG")
-    return currently_in_debug_mode
-    """
-    
-
-def is_nothing(thing: Any) -> bool:
-    if thing is None:
-        result = True
-    elif isinstance(thing, float):
-        result = np.isnan(thing)
-    elif hasattr(thing, "empty"):  # get_module_name_of(thing) == "pandas":
-        result = thing.empty
-    else:
-        result = not thing
-    return result
+def float_is_nothing(thing: Optional[float]) -> bool:
+    # return True if thing in {None, np.nan} else not thing
+    return thing is None or np.isnan(thing) or not thing
 
 
 def load_matrix_from(matrix_path: str):
@@ -379,21 +393,22 @@ def log(msg: str, level: int = logging.INFO):
     logging.getLogger(LOGGER_NAME).log(level, msg)
 
 
-def run_num_to_str(run_num:Optional[float] = 1):
-    return f"run-{int(run_num):02d}"
-
-
-def make_col_header(prefix: str, run_num:Optional[float] = 1) -> str:
+def make_col_header(prefix: str, run_num: Optional[float] = 1,
+                    debugging: bool = False) -> str:
     try:  
-        if is_nothing(run_num):
+        if float_is_nothing(run_num):  # run_num is None or np.isnan(run_num):  # is_nothing(run_num):
             run_num = 1
         return f"{prefix}_{run_num_to_str(run_num)}"
                 # if isnt_nothing(run_num) else prefix)  # TODO Ensure run number added
     except ValueError as e:
-        debug_or_raise(e, locals())
+        if debugging:
+            debug(e, locals())
+        else:
+            raise e
 
 
-def make_col_header_from(row: pd.Series, dtype: str, uniq=None) -> str:
+def make_col_header_from(row: pd.Series, dtype: str, uniq=None,
+                         debugging: bool = False) -> str:
     if uniq:
         uniq_col = uniq
         prefix, _ = get_header_vars_for(dtype)
@@ -402,7 +417,10 @@ def make_col_header_from(row: pd.Series, dtype: str, uniq=None) -> str:
     try:
         return make_col_header(f"{prefix}{row.get(uniq_col)}", row.get("run"))
     except ValueError as e:
-        debug_or_raise(e, locals())
+        if debugging:
+            debug(e, locals())
+        else:
+            raise e
     
 
 def make_default_out_file_name(key_DB: str):
@@ -518,7 +536,6 @@ class RegexForBidsDetails(LazyDict):
 
         # BIDS-valid file name -> tuple of 5 strings: subject ID, session ID,
         # task name, acquisition name/ID if any, and run number if any
-        # (sub-NDARINV.{8})(?:_)(ses-.*?)(?:_)(?:acq-)?(.*?)(?:_)?(?:dir-)(.*?)?(?:_)(?:run-)?([0-9]{2})?
         "fmap": ("subj", "-_", "ses", "-_", "acq", "-_?", "dir", "?", "-_",
                  "run", "-_?"),
 
@@ -529,7 +546,6 @@ class RegexForBidsDetails(LazyDict):
     })
 
     def __init__(self, *pattern_names: str) -> None:
-        # if self.SPLIT.keys()
         for pattern in pattern_names:
             self[pattern] = self.create(*self.SPLIT.lazyget(pattern, list))
 
@@ -540,7 +556,8 @@ class RegexForBidsDetails(LazyDict):
         return re.compile("".join([self.FIND.get(key, key) for key in args]))
     
 
-def explode_col(ser: pd.Series, re_patterns: RegexForBidsDetails, dtype: str) -> list:
+def explode_col(ser: pd.Series, re_patterns: RegexForBidsDetails, dtype: str,
+                debugging: bool = False) -> list:
     try:
         num_new_cols = DTYPE_2_UNIQ_COLS.get(dtype)
         exploded = ser.str.findall(re_patterns[dtype]
@@ -550,14 +567,30 @@ def explode_col(ser: pd.Series, re_patterns: RegexForBidsDetails, dtype: str) ->
         if ixs_NaNs.any():
             # assert exploded[~ixs_NaNs].any()
             # num_new_cols = len(exploded[~ixs_NaNs].iloc[0])
-            if is_nothing(num_new_cols):
+            if not num_new_cols:  # is_nothing(num_new_cols):
                 num_new_cols = len(exploded[~ixs_NaNs].iloc[0])
             exploded[ixs_NaNs] = exploded[ixs_NaNs].apply(
                 lambda _: [np.nan] * num_new_cols
             )
     except (AssertionError, AttributeError, KeyError, ValueError) as e:
-        debug_or_raise(e, locals())
+        if debugging:
+            debug(e, locals())
+        else:
+            raise e
     return exploded.to_list()
+
+
+def extract_from_json(json_path: str) -> Dict:
+    """
+    :param json_path: String, a valid path to a real readable .json file
+    :return: Dictionary, the contents of the file at json_path
+    """
+    with open(json_path, 'r') as infile:
+        return json.load(infile)
+
+
+def run_num_to_str(run_num:Optional[float] = 1):
+    return f"run-{int(run_num):02d}"
 
 
 def s3_get_info() -> LazyDict:
@@ -607,41 +640,29 @@ def save_to_hash_map_table(sub_ses_df: pd.DataFrame, subj_col: str,
     print(f"Saved hash mapping table of paths to {outfile_path}")
 
 
+def search_for_readable_file(fname: str, *dir_paths_to_search: str) -> str:
+    file_found_at = None
+    to_search = [fname] + [os.path.join(dir_path, fname)
+                           for dir_path in dir_paths_to_search]
+    ix = 0
+    while ix < len(to_search) and not file_found_at:
+        next_path_to_check = to_search[ix]
+        if os.access(next_path_to_check, os.R_OK):
+            file_found_at = next_path_to_check
+        else:
+            ix += 1
+    return file_found_at
+
+
 def show_keys_in(a_dict: Mapping[str, Any],# log:Callable = print,
-                 what_keys_are:str = "Local variables",
-                 level:int = logging.INFO) -> None:
+                 what_keys_are: str = "Local variables",
+                 level: int = logging.INFO) -> None:
     """
     :param a_dict: Dictionary mapping strings to anything
     :param log: Function to log/print text, e.g. logger.info or print
     :param what_keys_are: String naming what the keys are
     """
     log(f"{what_keys_are}: {stringify_list(uniqs_in(a_dict))}", level=level)
-
-
-def split_into_anats_and_funcs(s3_data: list) -> Mapping[str, list]:
-    try:
-        funcs = set()
-        anats_T = {1: set(), 2: set()}
-        for obj in s3_data:  # TODO OPTIMIZE by making s3_data a pd.DataFrame?
-            key = urllib.parse.unquote(obj["Key"])
-            parts = key.split("_")
-            
-            # Only get .nii.gz file name keys
-            last_part = parts[-1].split(".")
-            if last_part[-2] == "nii" and last_part[-1] == "gz":
-            # if parts[-1].endswith(".nii.gz"):
-                # dtype = {"bold": "func", "T1w": "anat", "T2w": "anat"}.get(last_part[0])
-                # if dtype == "anat":
-                if last_part[0] == "bold":  # TODO Optimize
-                    funcs.add(get_func_name(key))
-                elif last_part[0] == "T1w":
-                    anats_T[1].add(get_anat_name(key, 1))
-                elif last_part[0] == "T2w":
-                    anats_T[2].add(get_anat_name(key, 2))
-
-        return {"anat": [*anats_T[1], *anats_T[2]], "func": list(funcs)}
-    except KeyError:
-        return
 
 
 def stringify_list(a_list: list) -> str:
@@ -659,29 +680,6 @@ def stringify_list(a_list: list) -> str:
     return result
 
 
-class TaskNames:
-    def __init__(self) -> None:
-        self.all = LazyDict({"task-MID": "ABCD-MID-fMRI",
-                             "task-SST": "ABCD-SST-fMRI",
-                             "task-nback": "ABCD-nBack-fMRI",
-                             "task-rest": "ABCD-rsfMRI"}) 
-        self.inv = invert_dict(self.all)
-
-    def get_all(self, is_img_dsc: bool = False):
-        to_abbreviate = self.inv if is_img_dsc else self.all
-        return [x for x in to_abbreviate.keys()]
-
-    def get_all_abbreviated(self, is_img_dsc: bool = False):
-        return [self.abbreviate(x) for x in self.get_all(is_img_dsc)]
-    
-    def abbreviate(self, to_abbreviate: str) -> str:
-        abbreviated = to_abbreviate.split("-")[1]
-        return {"rsfMRI": "rs"}.get(abbreviated, abbreviated)
-
-    def swap(self, to_swap: str) -> str:
-        return self.all.get(to_swap, self.inv.get(to_swap, to_swap))
-
-
 def uniqs_in(listlike: Iterable[Hashable]) -> list:
     """
     Get an alphabetized list of unique, non-private local variables' names
@@ -695,9 +693,6 @@ def uniqs_in(listlike: Iterable[Hashable]) -> list:
     uniqs = [x for x in uniqs]
     uniqs.sort()
     return uniqs
-
-
-# def unquote(a_str: str) -> str: return urllib.parse.unquote(a_str)
 
 
 class UserAWSCreds:
@@ -722,7 +717,7 @@ class UserAWSCreds:
                              "manual" to prompt the user for those keys, or
                              None to try to get keys other ways, or something
                              else to raise an error  
-        :return: Dictionary mapping 
+        :return: LazyDict mapping 
         """
         aws_creds = LazyDict()  # Return value
         if keys_initial:
@@ -730,21 +725,17 @@ class UserAWSCreds:
                 if len(keys_initial) != 2:
                     self.error("Please give exactly two keys, your access "
                                "key and your secret key (in that order).") 
-                # self.validate(keys_initial)
                 for i in range(len(self.names)):
                     aws_creds[self.names[i]] = keys_initial[i]
         else:
             try:
                 aws_creds = s3_get_info()
-                # aws_keys = [aws_creds.get(key_name) for key_name in self.names]
             except (sp.CalledProcessError, ValueError):
                 pass
         for key_name in self.names:
             aws_creds.lazysetdefault(key_name, lambda:
                                      self.get_credential(key_name))
             self.validate_key(key_name, aws_creds[key_name])
-            # self.validate([aws_creds["access"], aws_creds["secret"]])
-            # aws_creds[f"{key_name}_key"] = aws_creds.pop(key_name)
         return aws_creds
     
     def validate_key(self, key_name: str, key_to_validate: str) -> None:
@@ -822,29 +813,16 @@ def validate(to_validate: Any, is_real: Callable, make_valid: Callable,
         raise argparse.ArgumentTypeError(err_msg.format(to_validate))
 
 
-def validate_dtseries(dtseries_path: str) -> str: 
-    variances = get_variance_of_each_row_of(dtseries_path)
-    # invalid_rows = variances.
-    """
-    invalid_rows = 0
-    for eachvar in variances:
-        if not eachvar:
-            invalid_rows += 1
-    if invalid_rows > THRESHOLD: pass  
-    """ # TODO
-
-
 def verbosity_is_at_least(verbosity: int) -> bool:
     """
     :param verbosity: Int, the number of times that the user included the
                       --verbose flag when they started running the script.
                       This number corresponds to the logging levels like so:
-                      verbosity 0: logging.ERROR == 40
-                      verbosity 1: logging.WARNING == 30
-                      verbosity 2: logging.INFO == 20
-                      verbosity 3+: logging.DEBUG == 10
-    :return: Boolean indicating whether or not the program is being run in
-             verbose mode
+                      verbosity == 0 corresponds to logging.ERROR(==40)
+                      verbosity == 1 corresponds to logging.WARNING(==30)
+                      verbosity == 2 corresponds to logging.INFO(==20)
+                      verbosity >= 3 corresponds to logging.DEBUG(==10)
+    :return: Bool indicating whether the program is being run in verbose mode
     """
     lowest_log_level = max(10, 40 - (10 * verbosity))
     return logging.getLogger().getEffectiveLevel() <= lowest_log_level

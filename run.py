@@ -4,7 +4,7 @@
 ABCC Audit Main Script 
 Greg Conan: gregmconan@gmail.com
 Created 2022-07-06
-Updated 2024-02-26
+Updated 2024-02-27
 """
 # Standard imports
 import argparse
@@ -42,6 +42,11 @@ def main():
 
 
 def pick_DBs_to_save(cli_args: Dict[str, Any]) -> Set[str]:
+    """
+    _summary_ 
+    :param cli_args: Dict[str, Any], _description_
+    :return: Set[str], _description_
+    """
     to_save = set()
     dont_save = set(cli_args["dont_save"])
     for which_DB in cli_args["audit"]:
@@ -50,8 +55,12 @@ def pick_DBs_to_save(cli_args: Dict[str, Any]) -> Set[str]:
     return to_save
 
 
-def make_s3_client_from_cli_args(cli_args):
-    # Get AWS credentials to access s3 buckets
+def make_s3_client_from_cli_args(cli_args: Dict[str, Any]):
+    """
+    Get AWS credentials to access s3 buckets 
+    :param cli_args: Dict[str, Any], _description_
+    :return: boto3.session.Session.client, _description_
+    """
     if not cli_args["aws_keys"]:
         my_s3info = s3_get_info()
         if my_s3info:
@@ -60,8 +69,12 @@ def make_s3_client_from_cli_args(cli_args):
     return UserAWSCreds(cli_args, argparse.ArgumentParser()).get_s3_client()
 
 
-def make_logger_from_cli_args(cli_args):
-    # Get logger, and prepare it to log to a file if the user said to
+def make_logger_from_cli_args(cli_args: Dict[str, Any]):
+    """
+    Get logger, and prepare it to log to a file if the user said to 
+    :param cli_args: Dict[str, Any], _description_
+    :return: logging.Logger, _description_
+    """
     log_to = dict()
     if cli_args.get("log"):
         if len(os.path.split(cli_args["log"])) > 1:
@@ -76,7 +89,6 @@ def _cli() -> Dict[str, Any]:
     """ 
     :return: Dict with all command-line arguments from user
     """
-    # audits = [audit.split("abcd-")[-1] for audit in audit_names]
     parser = argparse.ArgumentParser()
     dt_str = dt_format(datetime.now())
     DEFAULT_BUCKETS = ("ABCC_year1", "ABCC_year2", "ABCC_year4")
@@ -128,7 +140,6 @@ def _cli() -> Dict[str, Any]:
     )
     parser.add_argument(
         "--exclude", "--dont-save", "--no-save", "--dont-keep-DBs",
-        # "-save", "--save", "--save-DBs", "-keep", "--keep", "--keep-DBs",
         dest="dont_save",
         default=list(),
         choices=WHICH_DBS,
@@ -146,7 +157,7 @@ def _cli() -> Dict[str, Any]:
     )
     parser.add_argument(  # Only required if running DICOM DB Flow
         "-ftqc", "--fasttrack-qc",
-        dest="fpath_QC_CSV",
+        dest="fpath_FTQC",
         default=DEFAULT_FTQC,
         type=valid_readable_file, 
         help=(f"{MSG_VALID_PATH} abcd_fastqc01.txt file from the NDA."
@@ -155,7 +166,7 @@ def _cli() -> Dict[str, Any]:
     parser.add_argument(
         "-ftqc-DB", "-ftqc-db", "--fast-track-DB", "--ftqc-DB-file",
         dest="ftqc_DB_file",
-        # type=valid_readable_file,
+        type=valid_readable_file,
         help=MSG_DB.format("'ftq_usable' score (1.0 or 0.0)")
     )
     parser.add_argument(
@@ -197,13 +208,13 @@ def _cli() -> Dict[str, Any]:
     parser.add_argument(
         "-s3-db", "-s3-DB", "-s3db", "--s3-DB-file",
         dest="s3_DB_file",
-        # type=valid_readable_file,
+        type=valid_readable_file,
         help=MSG_DB.format("AWS s3 path within a given bucket")
     )
     parser.add_argument(
         "-tier1-DB", "-tier1-db", "--tier1-DB-file-path",
         dest="tier1_DB_file",
-        # type=valid_readable_file,
+        type=valid_readable_file,
         help=MSG_DB.format("valid local file path")
     )
     parser.add_argument(

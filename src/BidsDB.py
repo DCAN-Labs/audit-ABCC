@@ -556,14 +556,14 @@ class FastTrackQCDB(BidsDB):
         return ser.apply(dts2run.get).astype(int)
 
 
-    def make_FTQC_df_from(self, fpath_QC_CSV: str) -> pd.DataFrame:
+    def make_FTQC_df_from(self, fpath_FTQC: str) -> pd.DataFrame:
         """
-        :param fpath_QC_CSV: Valid path to existing abcd_fastqc01.txt file
+        :param fpath_FTQC: Valid path to existing abcd_fastqc01.txt file
         :return: pd.DataFrame, valid BidsDB.df of ftq_series_id values, with
                  1 subject session per row and 1 dtype-detail per column
         """
         # Read abcd_fastqc01.txt file and add col for each relevant detail
-        self.df = self.read_FTQC_df_from(fpath_QC_CSV)
+        self.df = self.read_FTQC_df_from(fpath_FTQC)
         self.add_cols_to_df_by_splitting("ftq_series_id")
         self.rename_df_cols()
         self.df["header"] = self.df["image_description"
@@ -868,7 +868,7 @@ class AllBidsDBs(LazyDict):
         # self.add_DB input parameters specific to each kind of BidsDB
         self.PARAMS = pd.DataFrame([
             [FastTrackQCDB, "ABCD FastTrack01 QC", "the NDA",
-             ["fpath_QC_CSV"]],
+             ["fpath_FTQC"]],
             [Tier1BidsDB, "Tier 1", "the NGDR space on the MSI",
              ["tier1_dir", "file_ext"]],
             [S3BidsDB, "Tier 2", "these AWS s3 buckets: " +
@@ -929,21 +929,23 @@ class AllBidsDBs(LazyDict):
                     file is covered for a subject session or 0.0 otherwise
         :return: float between 0 and 1; coverage percentage of row
         """
-        return row.sum() / (row.shape[0] - self.row_NaN_count.loc[row.name])
+        n_NaNs = self.row_NaN_count.loc[row.name]  # Exclude NaNs
+        return (row.sum() - n_NaNs) / (row.shape[0] - n_NaNs)
 
 
-    def make_DB(self, key: str, initalize_DB: Callable, **kwargs: Any
+    def make_DB(self, key: str, initialize_DB: Callable, **kwargs: Any
                 ) -> BidsDB:
         """
         :param key: String, shorthand name for which BIDS DB to create:
                     "ftqc"=FastTrackQCDB, "tier1"=Tier1BidsDB, "s3"=S3BidsDB
-        :param initalize_DB: Class object to create a BidsDB
+        :param initialize_DB: Class object to call to create a BidsDB
         :return: BidsDB
         """
-        return initalize_DB(in_fpath=self[f"{key}_DB_file"],
+        return initialize_DB(in_fpath=self[f"{key}_DB_file"],
                             dtypes=self["dtypes"], **self.COLS,
                             out_fpath=self.out_fpaths.get(key), 
                             debugging=self.debugging, **kwargs)
+
 
     def make_outfile_fpath(self, uniq_fname_part: str) -> str:
         """
@@ -1049,8 +1051,8 @@ class AllBidsDBs(LazyDict):
         self.row_NaN_count = detail_df.isna().sum(axis=1)
         for location in self.LOC_KEYS:
             COVG_LOC = f"coverage_{location}"
-            self.df[COVG_LOC] = detail_df.fillna(0.0).applymap(
-                lambda cell: cell if cell==0.0 else cell[COVG_LOC]
+            self.df[COVG_LOC] = detail_df.fillna(1.0).applymap(
+                lambda cell: cell if cell==1.0 else cell[COVG_LOC]
             ).apply(self.get_subj_ses_covg, axis=1)
         self.df["complete"] = self.df.apply(self.sub_ses_is_complete, axis=1)
         return self.df

@@ -3,7 +3,7 @@
 """
 Utilities for ABCC auditing workflow
 Originally written by Anders Perrone
-Updated by Greg Conan on 2024-02-26
+Updated by Greg Conan on 2024-03-05
 """
 # Standard imports
 import argparse
@@ -372,6 +372,9 @@ class LazyDict(dict):
         """
         return (self[key] if self.get(key) is not None else
                 self.setdefault(key, set_if_absent()))
+    
+    # def subset(self, *keys: Hashable) -> "LazyDict":
+    #     return LazyDict({key: self.get(key) for key in keys})
 
 
 def float_is_nothing(thing: Optional[float]) -> bool:
@@ -572,7 +575,7 @@ def explode_col(ser: pd.Series, re_patterns: RegexForBidsDetails, dtype: str,
             exploded[ixs_NaNs] = exploded[ixs_NaNs].apply(
                 lambda _: [np.nan] * num_new_cols
             )
-    except (AssertionError, AttributeError, KeyError, ValueError) as e:
+    except (AttributeError, KeyError, ValueError) as e:  # AssertionError, 
         if debugging:
             debug(e, locals())
         else:

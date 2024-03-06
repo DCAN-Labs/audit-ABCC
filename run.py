@@ -27,12 +27,16 @@ def main():
 
     make_logger_from_cli_args(cli_args)
 
-    # Make all BIDS DBs: tier1 (NGDR), tier 2 (s3), and fast-track QC DB
+
+    # Make all BIDS DBs: fast-track QC DB, tier1 (NGDR) DB, and finally tier 2
+    # (s3), finishing with s3 so that it can use the subject-session pairings 
+    # from the other BIDS DBs to know which to pull(?)
     client = make_s3_client_from_cli_args(cli_args)
     all_DBs = AllBidsDBs(cli_args, client=client,
                          sub_col="subject", ses_col="session")
-    for key in cli_args["audit"]:
-        all_DBs.add_DB(key)
+    for key in WHICH_DBS:  # First "ftqc", then "tier1", then "s3"
+        if key in cli_args["audit"]:
+            all_DBs.add_DB(key)
 
     if cli_args["debugging"]:
         pdb.set_trace()

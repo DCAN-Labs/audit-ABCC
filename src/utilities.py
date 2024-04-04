@@ -3,12 +3,13 @@
 """
 Utilities for ABCC auditing workflow
 Originally written by Anders Perrone
-Updated by Greg Conan on 2024-03-05
+Updated by Greg Conan on 2024-04-03
 """
 # Standard imports
 import argparse
 from collections.abc import Callable, Hashable
 from datetime import datetime
+import dateutil
 import functools
 from getpass import getpass
 from glob import glob
@@ -42,30 +43,26 @@ DTYPE_2_UNIQ_COLS = {"anat": ["rec-normalized", "run", "Tw"],
                      "func": ["task", "run"]}
 
 # Database path, data types definition fpath, temporarily hardcoded dirpath
-IMG_DSC_2_COL_HDR_FNAME = "image_description_to_header_col.json"
-LOGGER_NAME = "BidsDBLogger"
-PATH_ABCD_BIDS_DB = "/home/rando149/shared/projects/ABCC_year2_processing/s3_status_report.csv"
-PATH_DICOM_DB = "/home/rando149/shared/code/internal/utilities/abcd-dicom2bids/src/audit/ABCD_BIDS_db.csv"
+IMG_DSC_2_COL_HDR_FNAME = "img_desc_to_header_1_fmap_col.json"  # "img_desc_to_header_different_fmap_cols.json"
+LOGGER_NAME = __name__  # "BidsDBLogger"
 PATH_NGDR = "/spaces/ngdr/ref-data/abcd/nda-3165-2020-09/"
-SESSION_DICT = {'baseline_year_1_arm_1': 'ses-baselineYear1Arm1',
-                '2_year_follow_up_y_arm_1': 'ses-2YearFollowUpYArm1',
-                '4_year_follow_up_y_arm_1': 'ses-4YearFollowUpYArm1'}
 
 # Shorthand names for the different kinds of BIDS DBs
 WHICH_DBS = ("ftqc", "tier1", "s3")
 
 
-def main():
-    pd.set_option('display.max_columns', None)
+def main():  # Display all columns in a Pandas DataFrame
+    pd.set_option("display.max_columns", None)
 
 
 def attrs_in(an_obj: Any) -> List[str]:
     """
+    Get anything's public attributes. Convenience function for debugging.
     :param an_obj: Any
     :return: List of strings naming every public attribute in an_obj
     """
-    return uniqs_in([attr_name if not attr_name.startswith("_")
-                     else None for attr_name in dir(an_obj)])
+    return uniqs_in([attr_name for attr_name in list(dir(an_obj))
+                     if not attr_name.startswith("_")])
 
 
 def build_NGDR_fpath(root_BIDS_dir: str, parent_dirname: str,
@@ -106,6 +103,69 @@ def build_summary_str(ftqc: bool, s3: bool, tier1: bool, **_: Any) -> str:
                     " (tier1)" if tier1 else ""])
 
 
+class Debuggable:
+    def debug_or_raise(self, an_err: Exception, local_vars: Mapping[str, Any]
+                       ) -> None:
+        """
+        :param an_err: Exception (any)
+        :param local_vars: Dict[str, Any] mapping variables' names to their 
+                           values; locals() called from where an_err originated
+        :raises an_err: if self.debugging is False; otherwise pause to debug
+        """
+        if self.debugging:
+            debug(an_err, local_vars)
+        else:
+            raise an_err
+
+
+class DataFrameQuery(Debuggable):
+    def __init__(self) -> None:
+        pass  # Unused so calling DataFrameQuery(...) returns a pd.DataFrame
+
+    def __new__(self, df: pd.DataFrame, will_clean: bool = False,
+                **conditions: Any) -> pd.DataFrame:
+        """
+        :param df: pd.DataFrame to query/search (BidsDB.df)
+        :param will_clean: True to return a transposed dataframe without
+                           Nones or NaNs, to be convenient and readable
+        :param conditions: Dict[str, Any] mapping df column names to the
+                           values to find in those columns
+        :return: pd.DataFrame, df subset containing only rows matching 
+                 the given conditions
+        """
+        self.conditions = list()
+        self.df = df
+        try:
+            for col_name, col_value in conditions.items():
+                self.add(self, col_name, col_value)
+        except TypeError as e:
+            self.debug_or_raise(self, e, locals())
+        self.df.query(" & ".join(self.conditions), inplace=True)
+        if will_clean:
+            self.clean()
+        return self.df
+   
+    def add(self, col_name: str, col_value: Any) -> None:
+        """
+        :param col_name: String naming a column of self.df to filter. If it's
+        :param col_value: str, _description_
+        """
+        if col_name in self.df.index.names:
+            col_value = f"'{col_value}'"
+        else:
+            col_name = f"`{col_name}`"
+        self.conditions.append(f"{col_name} == {col_value}")
+
+    def clean(self) -> None:  # , df: pd.DataFrame) -> pd.DataFrame:
+        """
+        :param df: pd.DataFrame, BidsDB.df
+        :return: pd.DataFrame, df transposed without Nones or NaNs to be
+                 convenient and readable 
+        """
+        df = self.df.T
+        self.df = df[~df.isna()]
+
+
 def df_is_nothing(df: Optional[pd.DataFrame] = None) -> bool:
     """
     :param df: Object to check if it's nothing/empty/falsy
@@ -137,74 +197,75 @@ def default_pop(poppable: Any, key: Optional[Any] = None,
     :return: Object popped from poppable.pop(key), if any; otherwise default
     """
     try:
-        if key is None:
-            to_return = poppable.pop()
-        else:
-            to_return = poppable.pop(key)
+        to_return = poppable.pop() if key is None else poppable.pop(key)
     except (AttributeError, IndexError):
         to_return = default
     return to_return
 
 
 def dt_format(moment: datetime) -> str:
+    """
+    :param moment: datetime, a specific moment
+    :return: String, that moment in "YYYY-mm-dd_HH-MM-SS" format
+    """
     return moment.strftime("%Y-%m-%d_%H-%M-%S")
 
 
-def get_and_log_time_since(event_name, event_time):
-    """
-    Print and return a string showing how much time has passed since the
-    current running script reached a certain part of its process
-    :param event_name: String to print after 'Time elapsed since '
-    :param event_time: datetime object representing a time in the past
-    :param logger: logging.Logger object to show messages and raise warnings
-    :return: datetime.datetime representing the moment this function is called
-    """
-    right_now = datetime.now()  # dt.datetime.now()
-    log(f"\nTime elapsed since {event_name}: {right_now - event_time}")
-    return right_now
-
-
-def get_and_print_time_if(will_print: bool, event_time: datetime,
-                          event_name: str) -> datetime:
-    """
-    Print and return a string showing how much time has passed since the
-    current running script reached a certain part of its process
-    :param will_print: True to print an easily human-readable message
-                       showing how much time has passed since {event_time}
-                       when {event_name} happened, False to skip printing
-    :param event_time: datetime object representing a time in the past
-    :param event_name: String to print after 'Time elapsed '
-    :return: datetime object representing the current moment
-    """
-    timestamp = datetime.now()
-    if will_print:
-        print(f"\nTime elapsed {event_name}: {timestamp - event_time}")
-    return timestamp 
+def fill_run(ser):
+    run_nums = ser.dropna()
+    if not run_nums.empty:
+        if run_nums.shape[0] == 1:
+            ser = run_nums.iloc[0]
+        else:
+            pdb.set_trace()
+    return ser
 
 
 def get_col_headers_for(dtype: str, df: Optional[pd.DataFrame] = None) -> set:
+    """
+    :param dtype: str, data type, a key in DTYPE_2_UNIQ_COLS
+    :param df: pd.DataFrame to get column headers from, or None
+    :return: Set[str] of column headers made from df columns, or empty set
+    """
     # headers = set(headers) if headers else set()
     headers = set()
     prefix, uniq_col = get_header_vars_for(dtype)
-    if not (df is None or df.empty): # not is_nothing(df):
-        uniqs = df[uniq_col].unique()
+    if not df_is_nothing(df):
+        # loops = range(10)
+        # with ShowTimeTaken("getting headers with a double for loop"):  
+        #     for _ in loops:  
+        headers = set()  # Block ran in 0:00:00.000513
         runs = df["run"].unique()
-        # pdb.set_trace()
+        uniqs = [dtype] if uniq_col == "dtype" else df[uniq_col].unique()
         for run in runs:
             for uniq in uniqs:
                 headers.add(make_col_header(f"{prefix}{uniq}", run))
+        # with ShowTimeTaken('using groupby'): headers = set(df.groupby(['run', uniq_col]).apply(lambda df: make_col_header(f"{prefix}{df.iloc[0][uniq_col]}", df.iloc[0].run)))  # Line ran in 0:00:00.006132
+        # with ShowTimeTaken("getting headers with pd.apply"):
+            # headers = np.apply_along_axis(arr=df[["run", uniq_col]].value_counts().index, func1d=lambda pair: make_col_header(f"{prefix}{pair[uniq_col]}"), axis=0)
+        # with ShowTimeTaken('using drop_duplicates'): print(set(df.drop_duplicates(subset=['run', uniq_col]).apply(lambda row: make_col_header(f"{prefix}{row.get(uniq_col):.0f}", row.get("run")), axis=1)))  # Line ran in 0:00:00.002146
+    if np.nan in headers:
+        headers -= {np.nan}
     return headers
 
 
-def get_most_recent_FTQC_fpath(incomplete_dirpath_FTQC):
+def get_most_recent_FTQC_fpath(incomplete_dirpath_FTQC: str) -> str:
+    """
+    :param incomplete_dirpath_FTQC: Fast Track QC directory paths with "{}"
+                                    in place of any differences between them
+    :return: str, valid path to most recent readable Fast Track QC
+             spreadsheet text file, or None if no readable FTQC files found
+    """
+    COLS = LazyDict(fpath="fpath", DT="datetimestamp", can_read="is_readable")
+
     # Get all readable abcd_fastqc01.txt file paths
-    ftqc_paths = pd.DataFrame({"fpath":
+    ftqc_paths = pd.DataFrame({COLS.fpath:
                                glob(incomplete_dirpath_FTQC.format("*"))})
-    ftqc_paths["readable"] = ftqc_paths["fpath"].apply(
+    ftqc_paths[COLS.can_read] = ftqc_paths[COLS.fpath].apply(
         lambda fpath: os.access(fpath, os.R_OK)
     )
     # ftqc_paths.drop(index=~ftqc_paths["readable"], inplace=True)
-    ftqc_paths = ftqc_paths[ftqc_paths["readable"]]
+    ftqc_paths = ftqc_paths[ftqc_paths[COLS.can_read]]
 
     # If there are no readable abcd_fastqc01.txt file paths, return None
     if ftqc_paths.empty:
@@ -213,26 +274,30 @@ def get_most_recent_FTQC_fpath(incomplete_dirpath_FTQC):
 
         # Get the datetimestamp (int) from each abcd_fastqc01.txt file name
         prefix, suffix = incomplete_dirpath_FTQC.split("{}")
-        ftqc_paths["dtstamp"] = \
-            ftqc_paths["fpath"].str.strip(prefix).str.rstrip(suffix)
-        ftqc_paths["dtstamp"] = ftqc_paths["dtstamp"].astype(int)
+        ftqc_paths[COLS.DT] = \
+            ftqc_paths[COLS.fpath].str.strip(prefix).str.rstrip(suffix)
+        ftqc_paths[COLS.DT] = ftqc_paths[COLS.DT].astype(int)
 
         # Return the path to the most recent abcd_fastqc01.txt file
-        most_recent_FTQC = \
-            ftqc_paths.loc[ftqc_paths["dtstamp"].idxmax(), "fpath"]
+        most_recent_FTQC = ftqc_paths.loc[ftqc_paths[COLS.DT].idxmax(),
+                                          COLS.fpath]
     return most_recent_FTQC
 
 
 def get_ERI_filepath(bids_dir_path: str) -> str:
+    """
+    :param bids_dir_path: str, valid path to BIDS root directory
+    :return: str, globbable incomplete path to EventRelatedInformation file
+    """
     return build_NGDR_fpath(os.path.join(bids_dir_path, "sourcedata"),
-                            "func", "task-*_run-*"
-                            "_bold_EventRelatedInformation.txt")
+                            "func", "task-*_run-*_bold_"
+                            "EventRelatedInformation.txt")
 
 
 def get_header_vars_for(dtype: str) -> Tuple[str]:
     return {"func":      ("task-", "task"),
             "anat":      ("T", "Tw"),
-            "fmap":      ("FM-", "dir"),
+            "fmap":      ("FM_", "dir"),
             "dwi":       ("", "dtype") # "dtype" -> uniq_col with only 1 value
             }.get(dtype, ("", ""))
 
@@ -275,9 +340,10 @@ def invert_dict(a_dict: Dict[Hashable, Hashable],
     else:  # By default, simply set every value to a key and vice versa
         new_dict = {v: k for k, v in a_dict.items()}
     return new_dict
+    
 
 
-class ImgDscColNameSwapper:  # (LazyDict): 
+class ImgDscColNameSwapper:  # (Debuggable):  # (LazyDict): 
     def __init__(self, json_fpath: Optional[str] = None) -> None:
         self.fpath = self.find_fpath(json_fpath)
         self.dsc2hdr = extract_from_json(self.fpath)
@@ -289,15 +355,20 @@ class ImgDscColNameSwapper:  # (LazyDict):
         self.dtype_of = LazyDict()
         HDR_PFX_2_DTYPE = {"T1": "anat", "T2": "anat", "task": "func",
                            "FM": "fmap", "dwi": "dwi"}
+        SPLIT_BY = re.compile("-|_")  # image_description delimiters
         for dsc, hdr in self.dsc2hdr.items():
-            self.dtype_of[hdr] = (HDR_PFX_2_DTYPE.get(hdr.split("-", 1)[0], None)
-                                  if hdr else None)  # self.hdr_col_to_dtype(hdr)
+            
+            self.dtype_of[hdr] = HDR_PFX_2_DTYPE.get(SPLIT_BY.split(hdr, 1)[0]
+                                                     ) if hdr else None
+            # self.dtype_of[hdr] = (HDR_PFX_2_DTYPE.get(hdr.split("-", 1)[0], None)
+                                  # if hdr else None)  # self.hdr_col_to_dtype(hdr)
             self.dtype_of[dsc] = self.dtype_of[hdr]
 
+    # TODO Make this a cli_args parameter?
     def find_fpath(self, json_fpath: Optional[str] = None) -> str:
         to_check = list()
         if json_fpath:
-            fname, dir_to_check = os.path.split(json_fpath)
+            dir_to_check, fname = os.path.split(json_fpath)
             to_check = [dir_to_check]
         else:
             fname = IMG_DSC_2_COL_HDR_FNAME
@@ -352,8 +423,8 @@ class LazyDict(dict):
         """
         self.__setitem__(__name, __value)
 
-    def lazyget(self, key: Hashable,
-                get_if_absent:Optional[Callable] = lambda: None) -> Any:
+    def lazyget(self, key: Hashable, get_if_absent:
+                Optional[Callable] = lambda: None) -> Any:
         """
         LazyButHonestDict.lazyget from stackoverflow.com/q/17532929
         :param key: Object (hashable) to use as a dict key
@@ -362,16 +433,16 @@ class LazyDict(dict):
         """
         return self[key] if self.get(key) is not None else get_if_absent()
     
-    def lazysetdefault(self, key: Hashable,
-                       set_if_absent:Optional[Callable] = lambda: None) -> Any:
+    def lazysetdefault(self, key: Hashable, get_if_absent:
+                       Optional[Callable] = lambda: None) -> Any:
         """
         LazyButHonestDict.lazysetdefault from stackoverflow.com/q/17532929 
         :param key: Object (hashable) to use as a dict key
-        :param set_if_absent: function that returns the default value
+        :param get_if_absent: function that returns the default value
         :return: _type_, _description_
         """
         return (self[key] if self.get(key) is not None else
-                self.setdefault(key, set_if_absent()))
+                self.setdefault(key, get_if_absent()))
     
     # def subset(self, *keys: Hashable) -> "LazyDict":
     #     return LazyDict({key: self.get(key) for key in keys})
@@ -393,16 +464,18 @@ def load_matrix_from(matrix_path: str):
 
 
 def log(msg: str, level: int = logging.INFO):
-    logging.getLogger(LOGGER_NAME).log(level, msg)
+    SplitLogger.logAtLevel(level, msg)
 
 
-def make_col_header(prefix: str, run_num: Optional[float] = 1,
+def make_col_header(prefix: str, run_num: Optional[float] = None,  # run_num=1
                     debugging: bool = False) -> str:
     try:  
         if float_is_nothing(run_num):  # run_num is None or np.isnan(run_num):  # is_nothing(run_num):
-            run_num = 1
-        return f"{prefix}_{run_num_to_str(run_num)}"
-                # if isnt_nothing(run_num) else prefix)  # TODO Ensure run number added
+            header = np.nan  # prefix  # run_num = 1  # TODO Figure out what to do with rows with bad QC (& therefore no run numbers), by asking or by comparing with the original abcd-dicom2bids audit script(s)
+        else:
+            header = f"{prefix}_{run_num_to_str(run_num)}"
+        return header  # return f"{prefix}_{run_num_to_str(run_num)}"
+                # if isnt_nothing(run_num) else prefix)  # TODO Ensure run number added?
     except ValueError as e:
         if debugging:
             debug(e, locals())
@@ -444,24 +517,6 @@ def make_ERI_filepath(parent: str, subj_ID: str, session: str, task: str,
     return os.path.join(parent, "sourcedata", subj_ID, session, "func",
                         f"{subj_ID}_{session}_task-{task}_run-{run}_bold_"
                         "EventRelatedInformation.txt")
-
-
-def make_logger(verbosity: int, out: Optional[str] = None,
-                err: Optional[str] = None) -> logging.Logger:
-    """
-    Make logger to log status updates, warnings, and other important info
-    :return: logging.Logger able to print info to stdout and problems to stderr
-    """  # TODO stackoverflow.com/a/33163197 ?
-    err_log = dict(filename=err) if err else dict(stream=sys.stderr)
-    out_log = dict(filename=out) if out else dict(stream=sys.stdout)
-    FMT = "\n%(levelname)s %(asctime)s: %(message)s"
-    if verbosity > 0:
-        logging.basicConfig(**out_log, format=FMT, level=logging.INFO) 
-    if verbosity > 2:
-        logging.basicConfig(**out_log, format=FMT, level=logging.DEBUG)
-    logging.basicConfig(**err_log, format=FMT, level=logging.ERROR)
-    logging.basicConfig(**err_log, format=FMT, level=logging.WARNING)
-    return logging.getLogger(LOGGER_NAME)  # os.path.basename(sys.argv[0]))
 
 
 def mutual_reindex(*dfs: pd.DataFrame, fill_value:
@@ -562,7 +617,8 @@ class RegexForBidsDetails(LazyDict):
 def explode_col(ser: pd.Series, re_patterns: RegexForBidsDetails, dtype: str,
                 debugging: bool = False) -> list:
     try:
-        num_new_cols = DTYPE_2_UNIQ_COLS.get(dtype)
+        new_cols = DTYPE_2_UNIQ_COLS.get(dtype)
+        num_new_cols = len(new_cols) if new_cols else None
         exploded = ser.str.findall(re_patterns[dtype]
                                    ).explode(ignore_index=True)
         # exploded[exploded.isna()] = [''] * 5
@@ -668,6 +724,99 @@ def show_keys_in(a_dict: Mapping[str, Any],# log:Callable = print,
     log(f"{what_keys_are}: {stringify_list(uniqs_in(a_dict))}", level=level)
 
 
+class ShowTimeTaken:
+    def __init__(self, doing_what: str, show: Callable = log) -> None:
+        """
+        Context manager to time and log the duration of any block of code 
+        :param doing_what: String describing what is being timed
+        :param show: Function to print/log/show messages to the user
+        """
+        self.doing_what = doing_what
+        self.show = show
+
+    def __call__(self):
+        pass
+
+    def __enter__(self):
+        """
+        Log the moment that script execution enters the context manager and
+        what it is about to do. 
+        """
+        self.show(f"Just started {self.doing_what}")
+        self.start = datetime.now()
+        return self
+    
+    def __exit__(self, exc_type: Optional[type] = None,
+                 exc_val: Optional[BaseException] = None, exc_tb=None):
+        """
+        Log the moment that script execution exits the context manager and
+        what it just finished doing. 
+        :param exc_type: Exception type
+        :param exc_val: Exception value
+        :param exc_tb: Exception traceback
+        """
+        self.elapsed = datetime.now() - self.start
+        self.show(f"\nTime elapsed {self.doing_what}: {self.elapsed}")
+        # if any((exc_type, exc_val, exc_tb)):
+        #     exc_type(exc_val, exc_tb)  #?
+
+
+class SplitLogger(logging.getLoggerClass()):  # 
+    FMT = "\n%(levelname)s %(asctime)s: %(message)s"
+    LVL = LazyDict(OUT={logging.DEBUG, logging.INFO},
+                   ERR={logging.CRITICAL, logging.ERROR, logging.WARNING})
+    NAME = LOGGER_NAME  # "BidsDBLogger"
+
+
+    def __init__(self, verbosity: int, out_fpath: Optional[str] = None,
+                 err_fpath: Optional[str] = None) -> None:
+        """
+        Make logger to log status updates, warnings, and other important info.
+        SplitLogger can log errors/warnings/problems to one stream/file and
+        log info/outputs/messages to a different stream/file.
+        :param verbosity: Int, the number of times that the user included the
+                          --verbose flag when they started running the script.
+        :param out_fpath: Valid path to text file to write output logs into
+        :param err_fpath: Valid path to text file to write error logs into
+        """  # TODO stackoverflow.com/a/33163197 ?
+        super().__init__(self.NAME, level=verbosity_to_log_level(verbosity))
+        self.addSubLogger("out", sys.stdout, out_fpath)
+        self.addSubLogger("err", sys.stderr, err_fpath)
+
+
+    def addSubLogger(self, sub_name: str, log_stream,
+                     log_file_path: Optional[str] = None):
+        """
+        Make a child Logger to handle one kind of message (namely err or out) 
+        :param name: String naming the child logger, accessible as
+                     self.getLogger(f"{self.NAME}.{sub_name}")
+        :param log_stream: io.TextIOWrapper, namely sys.stdout or sys.stderr
+        :param log_file_path: Valid path to text file to write logs into
+        """
+        sublogger = self.getChild(sub_name)
+        sublogger.setLevel(self.level)
+        handler = (logging.FileHandler(log_file_path, encoding="utf-8")
+                   if log_file_path else logging.StreamHandler(log_stream))
+        handler.setFormatter(logging.Formatter(fmt=self.FMT))
+        sublogger.addHandler(handler)
+
+
+    @classmethod
+    def logAtLevel(cls, level: int, msg: str) -> None:
+        """
+        Log a message, using the sub-logger specific to that message's level 
+        :param level: logging._levelToName key; level to log the message at
+        :param msg: String, the message to log
+        """
+        logger = logging.getLogger(cls.NAME)
+        if level in cls.LVL.ERR:
+            sub_log_name = "err"
+        elif level in cls.LVL.OUT:
+            sub_log_name = "out"
+        sublogger = logger.getChild(sub_log_name)
+        sublogger.log(level, msg)
+
+
 def stringify_list(a_list: list) -> str:
     """ 
     :param a_list: List (any)
@@ -681,6 +830,15 @@ def stringify_list(a_list: list) -> str:
         else:
             result = list_with_str_els[0]
     return result
+
+
+def checkout(df):
+    if df.empty:
+        log(df.index.values)
+    elif df.shape[0] > 1:# and not df[df["image_description"]=="ABCD-rsfMRI"].empty:
+        log("Checking out df")
+        pdb.set_trace()
+        log("Done")
 
 
 def uniqs_in(listlike: Iterable[Hashable]) -> list:
@@ -699,19 +857,22 @@ def uniqs_in(listlike: Iterable[Hashable]) -> list:
 
 
 class UserAWSCreds:
-    def __init__(self, cli_args: dict, parser: argparse.ArgumentParser
-                 ) -> None:
+    # AWS s3 key names and their lengths
+    NAMES = ["access", "secret"]
+    LENS = {key: keylen for key, keylen in zip(NAMES, [20, 40])}
+
+
+    def __init__(self, cli_args: Mapping[str, Any],
+                 parser: argparse.ArgumentParser) -> None:
         """
         _summary_ 
-        :param cli_args: dict, _description_
+        :param cli_args: Mapping[str, Any] of command-line input arguments
         :param parser: argparse.ArgumentParser to raise an argparse error 
                        immediately if any parameters the user gave are invalid
         """
         self.error = parser.error
         self.host = cli_args["host"]
-        self.lens =  {"access": 20, "secret": 40} # AWS s3 key names and their lengths
-        self.names = list(self.lens.keys())
-        self.keys = self.get_and_validate(cli_args.get("aws_keys"))
+        self.keys = self.get_and_validate(default_pop(cli_args, "aws_keys")) #cli_args.get("aws_keys"))
 
     def get_and_validate(self, keys_initial=list()) -> LazyDict:  # , cli_args, parser):
         """
@@ -728,32 +889,42 @@ class UserAWSCreds:
                 if len(keys_initial) != 2:
                     self.error("Please give exactly two keys, your access "
                                "key and your secret key (in that order).") 
-                for i in range(len(self.names)):
-                    aws_creds[self.names[i]] = keys_initial[i]
+                for i in range(len(self.NAMES)):
+                    aws_creds[self.NAMES[i]] = keys_initial[i]
         else:
             try:
                 aws_creds = s3_get_info()
             except (sp.CalledProcessError, ValueError):
                 pass
-        for key_name in self.names:
+        for key_name in self.NAMES:
             aws_creds.lazysetdefault(key_name, lambda:
                                      self.get_credential(key_name))
             self.validate_key(key_name, aws_creds[key_name])
         return aws_creds
     
     def validate_key(self, key_name: str, key_to_validate: str) -> None:
-        key_len = self.lens[key_name]
+        key_len = self.LENS[key_name]
         if len(key_to_validate) != key_len:
             self.error(f"Your AWS {key_name} key must be {key_len} "
                        "characters long.")
 
-    def get_s3_client(self): # , host, access_key, secret_key):
-        return boto3.session.Session().client(
+    def get_s3_client(self) -> boto3.session.Session.client: # , host, access_key, secret_key):
+        ses = boto3.session.Session()
+
+        # Speed up datetime parsing to speed up listing boto3 bucket contents
+        # See https://adobke.com/blog/posts/speeding-up-boto3-list-objects/
+        parser_factory = ses._session.get_component("response_parser_factory")
+        parser_factory.set_parser_defaults(
+            timestamp_parser=dateutil.parser.isoparse
+        )
+        
+        return ses.client(
             "s3", endpoint_url=self.host, aws_access_key_id=self.keys.access,
             aws_secret_access_key=self.keys.secret
         )
 
-    def get_credential(self, cred_name: str, input_fn=getpass) -> str:  # , cli_args):
+    def get_credential(self, cred_name: str, input_fn: Callable = getpass
+                       ) -> str:  # , cli_args):
         """
         If AWS credential was a CLI arg, return it; otherwise prompt user for it 
         :param cred_name: String naming which credential (username or password)
@@ -816,19 +987,27 @@ def validate(to_validate: Any, is_real: Callable, make_valid: Callable,
         raise argparse.ArgumentTypeError(err_msg.format(to_validate))
 
 
+def verbosity_to_log_level(verbosity: int) -> int:
+    """
+    :param verbosity: Int, the number of times that the user included the
+                      --verbose flag when they started running the script.
+    :return: Level for logging, corresponding to verbosity like so:
+             verbosity == 0 corresponds to logging.ERROR(==40)
+             verbosity == 1 corresponds to logging.WARNING(==30)
+             verbosity == 2 corresponds to logging.INFO(==20)
+             verbosity >= 3 corresponds to logging.DEBUG(==10)
+    """
+    return max(10, 40 - (10 * verbosity))
+
+
 def verbosity_is_at_least(verbosity: int) -> bool:
     """
     :param verbosity: Int, the number of times that the user included the
                       --verbose flag when they started running the script.
-                      This number corresponds to the logging levels like so:
-                      verbosity == 0 corresponds to logging.ERROR(==40)
-                      verbosity == 1 corresponds to logging.WARNING(==30)
-                      verbosity == 2 corresponds to logging.INFO(==20)
-                      verbosity >= 3 corresponds to logging.DEBUG(==10)
     :return: Bool indicating whether the program is being run in verbose mode
     """
-    lowest_log_level = max(10, 40 - (10 * verbosity))
-    return logging.getLogger().getEffectiveLevel() <= lowest_log_level
+    return logging.getLogger().getEffectiveLevel() \
+               <= verbosity_to_log_level(verbosity)
 
 
 if __name__ == "__main__":

@@ -3,22 +3,22 @@
 """
 ABCC Audit Main Script 
 Greg Conan: gregmconan@gmail.com
-Created 2022-07-06
-Updated 2024-02-27
+Created: 2022-07-06
+Updated: 2024-04-03
 """
 # Standard imports
 import argparse
 from datetime import datetime
 import os
 import pdb
-from typing import Any, Dict, Set
+from typing import Any, Dict, Mapping, Set
 
 # Local imports
 from src.BidsDB import AllBidsDBs
 from src.utilities import (
-    dt_format, get_most_recent_FTQC_fpath, make_logger, PATH_NGDR,
-    s3_get_info, UserAWSCreds, valid_output_dir, valid_readable_dir,
-    valid_readable_file, WHICH_DBS
+    dt_format, get_most_recent_FTQC_fpath, IMG_DSC_2_COL_HDR_FNAME,
+    PATH_NGDR, s3_get_info, SplitLogger, UserAWSCreds, valid_output_dir,
+    valid_readable_dir, valid_readable_file, WHICH_DBS
 )
 
 def main():
@@ -38,17 +38,20 @@ def main():
         if key in cli_args["audit"]:
             all_DBs.add_DB(key)
 
-    if cli_args["debugging"]:
-        pdb.set_trace()
+    if len(cli_args["audit"]) == 3:       
+        all_DBs.summarize()
 
-    if len(cli_args["audit"]) == 3:
-        all_DBs.save_all_summary_tsv_files()
+        if cli_args["debugging"]:
+            pdb.set_trace()
+
+        if "summary" not in cli_args["dont_save"]:
+            all_DBs.save_all_summary_tsv_files()
 
 
 def pick_DBs_to_save(cli_args: Dict[str, Any]) -> Set[str]:
     """
     _summary_ 
-    :param cli_args: Dict[str, Any], _description_
+    :param cli_args: Mapping[str, Any] of command-line input arguments
     :return: Set[str], _description_
     """
     to_save = set()
@@ -59,10 +62,10 @@ def pick_DBs_to_save(cli_args: Dict[str, Any]) -> Set[str]:
     return to_save
 
 
-def make_s3_client_from_cli_args(cli_args: Dict[str, Any]):
+def make_s3_client_from_cli_args(cli_args: Mapping[str, Any]):
     """
     Get AWS credentials to access s3 buckets 
-    :param cli_args: Dict[str, Any], _description_
+    :param cli_args: Mapping[str, Any] of command-line input arguments
     :return: boto3.session.Session.client, _description_
     """
     if not cli_args["aws_keys"]:
@@ -73,10 +76,10 @@ def make_s3_client_from_cli_args(cli_args: Dict[str, Any]):
     return UserAWSCreds(cli_args, argparse.ArgumentParser()).get_s3_client()
 
 
-def make_logger_from_cli_args(cli_args: Dict[str, Any]):
+def make_logger_from_cli_args(cli_args: Mapping[str, Any]):
     """
     Get logger, and prepare it to log to a file if the user said to 
-    :param cli_args: Dict[str, Any], _description_
+    :param cli_args: Mapping[str, Any] of command-line input arguments
     :return: logging.Logger, _description_
     """
     log_to = dict()
@@ -86,7 +89,7 @@ def make_logger_from_cli_args(cli_args: Dict[str, Any]):
         else:
             cli_args["log"] = os.path.join(cli_args["output"], cli_args["log"])
         log_to = dict(out=cli_args["log"], err=cli_args["log"])
-    return make_logger(cli_args["verbosity"], **log_to)
+    return SplitLogger(cli_args["verbosity"], **log_to)  # make_logger(cli_args["verbosity"], **log_to)
 
 
 def _cli() -> Dict[str, Any]: 
@@ -95,10 +98,14 @@ def _cli() -> Dict[str, Any]:
     """
     parser = argparse.ArgumentParser()
     dt_str = dt_format(datetime.now())
+
+    SCRIPT_DIR = os.path.dirname(__file__)
+
     DEFAULT_BUCKETS = ("ABCC_year1", "ABCC_year2", "ABCC_year4")
-    DEFAULT_DTYPES = ("anat", "func", "fmap") #, dwi
+    DEFAULT_DTYPES = ("anat", "func", "fmap", "dwi")
     DEFAULT_FILE_EXT = ".json"
     DEFAULT_HOST = "https://s3.msi.umn.edu"
+    DEFAULT_IMG2HDR = os.path.join(SCRIPT_DIR, IMG_DSC_2_COL_HDR_FNAME)
     DEFAULT_FTQC = get_most_recent_FTQC_fpath(
         "/home/rando149/shared/code/internal/utilities/"
         "abcd-dicom2bids/spreadsheets/fastqc{}/abcd_fastqc01.txt"
@@ -132,9 +139,10 @@ def _cli() -> Dict[str, Any]:
         "-b", "--buckets", "--s3-buckets", "--s3-bucket-names", 
         nargs='+',
         dest="buckets",
-        default=DEFAULT_BUCKETS,
-        help=("List of bucket names containing ABCD BIDS data."
-              + MSG_DEFAULT.format(DEFAULT_BUCKETS))
+        default=DEFAULT_BUCKETS[:2],  # TODO default=DEFAULT_BUCKETS,  # once I actually can access ABCC_year4 
+        help=("List of bucket names containing ABCD BIDS data. Excluding "
+              "this argument is the same as including `--buckets "
+              f"{' '.join(DEFAULT_BUCKETS)}`")
     )
     parser.add_argument(
         "-d", "--debug", "--debugging",
@@ -146,7 +154,7 @@ def _cli() -> Dict[str, Any]:
         "--exclude", "--dont-save", "--no-save", "--dont-keep-DBs",
         dest="dont_save",
         default=list(),
-        choices=WHICH_DBS,
+        choices=[*WHICH_DBS, "summary"],
         nargs="+",
         help=("Which BIDS DBs you do not want to save to files. By default, "
               "all BIDS DBs created will be saved. BIDS DBs created "
@@ -178,6 +186,16 @@ def _cli() -> Dict[str, Any]:
         dest="host",
         default=DEFAULT_HOST, 
         help=("URL path to AWS s3 host." + MSG_DEFAULT.format(DEFAULT_HOST))
+    )
+    parser.add_argument(
+        "-i", "-img2hdr", "-img-dsc-2-hdr", "--image-desc-to-header",
+        dest="img2hdr_fpath",
+        default=DEFAULT_IMG2HDR,
+        type=valid_readable_file,
+        help=(f"{MSG_VALID_PATH} .JSON file mapping `image_description` "
+              "strings from the Fast Track QC spreadsheet to names of "
+              "header columns in the output spreadsheets."
+              f"{MSG_DEFAULT.format(DEFAULT_IMG2HDR)}")
     )
     parser.add_argument(
         "-k", "-keys", "-creds", "--aws-keys", "--aws-creds",

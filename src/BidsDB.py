@@ -165,21 +165,22 @@ class BidsDBDetailsForType(Debuggable):
                                         will_add_run=True, **specifier,
                                         run_col=self.COLS.run)
         
+        # Make and keep column headers
         if from_FTQC:
             self.add_header_col()
             self.COLS[dtype] = set(self.df[self.COLS.hdr].dropna().unique())
         else:
             self.make_df_from_fpaths()
-            
             self.COLS[dtype] = self.hdr_mkr.get_all_for(df=self.df)
 
         # Remove any rows containing NaN in the drop_NaN_from column(s)
         if drop_NaN_from:
             self.df.dropna(subset=drop_NaN_from, inplace=True)
-        # if dtype == "anat":
+
+        # By default, any column without a run number is run-01
         if not from_FTQC:
             self.df.loc[self.df[self.COLS.run] == "", self.COLS.run] = 1
-            self.add_header_col()  # TODO ?
+            self.add_header_col()
 
 
     def add_header_col(self) -> Dict[str, pd.DataFrame]:
@@ -222,10 +223,8 @@ class BidsDBDetailsForType(Debuggable):
         """
         try:
             sub_ses_dict_cols = self.COLS[self.dtype]
-            # sub_ses_dict_cols = self.COLS.lazyget(self.dtype, lambda: self.df[self.COLS.hdr].unique())
         except (AttributeError, KeyError) as e:
             self.debug_or_raise(e, locals())
-        # sub_ses_dict_cols = self.COLS.dtype  # self.df[self.COLS.hdr].unique() if self.COLS.hdr in self.df else 
         dicts_for_df = self.df.groupby(self.COLS.ID.sub_ses).apply(
             lambda sub_ses_df: self.make_subj_ses_dict(
                 sub_ses_df, sub_ses_dict_cols
@@ -233,9 +232,7 @@ class BidsDBDetailsForType(Debuggable):
         )
         final_df = pd.DataFrame(dicts_for_df.values.tolist(),
                                 columns=[*self.COLS.ID.sub_ses,
-                                         *sub_ses_dict_cols])  # *self.COLS.dtype])
-        if self.debugging:
-            pdb.set_trace()
+                                         *sub_ses_dict_cols])
         return final_df.dropna(how="all", axis=1)
         
 
@@ -349,7 +346,6 @@ class BidsDB(LazyDict, Debuggable):
             details_for_dtype.append(BidsDBDetailsForType(
                 dtype=dtype, df=df, **details
             ))
-            # self.COLS[dtype] = details_for_dtype[-1].COLS.dtype
             non_ID_COLS.update(details_for_dtype[-1].COLS[dtype])
 
         self.COLS.lazysetdefault("all", lambda: [*self.COLS.ID.sub_ses,
@@ -405,8 +401,8 @@ class BidsDB(LazyDict, Debuggable):
 
     def merge_N_dfs(self, *dfs: pd.DataFrame) -> pd.DataFrame:
         """
-        _summary_ 
-        :return: pd.DataFrame, _description_
+        :param dfs: Iterable[pd.DataFrame] to merge into one pd.DataFrame
+        :return: pd.DataFrame, all input dfs merged on subject and session ID
         """  # TODO Implement switch-case (finally) added in Python 3.10
         n_dfs = len(dfs)
         if n_dfs > 2:
@@ -908,7 +904,7 @@ class S3Bucket(S3BidsDB):
         self.dtypes = dtypes
         self.file_ext = file_ext
         self.name = bucket_name
-        # self.session = BUCKET2SES[bucket_name]  # Don't assume 1 bucket per session
+        self.session = BUCKET2SES[bucket_name]  # TODO Don't assume 1 bucket per session
 
         with ShowTimeTaken(f"auditing s3://{self.name} bucket"):
             self.ensure_has_COLS(sub=sub_col, ses=ses_col,

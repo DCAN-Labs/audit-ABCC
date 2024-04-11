@@ -21,7 +21,7 @@ import re
 import subprocess as sp
 import sys
 from typing import (Any, Dict, Generator, Iterable, List,  # Literal, 
-                    Mapping, Optional, Set, Union)  # Tuple, 
+                    Mapping, Optional, Set, Tuple, Union)
 
 # External (pip/PyPI) imports
 import boto3
@@ -103,7 +103,8 @@ def build_summary_str(ftqc: bool, s3: bool, tier1: bool, **_: Any) -> str:
                     " (tier1)" if tier1 else ""])
 
 
-class Debuggable:
+class Debuggable:  # I put the debugger function in a class so it can use its
+                   # implementer classes' self.debugging variable
     def debug_or_raise(self, an_err: Exception, local_vars: Mapping[str, Any]
                        ) -> None:
         """
@@ -119,6 +120,7 @@ class Debuggable:
 
 
 class ColHeaderFactory(Debuggable):
+    # 
     DTYPE_2_PREFIX_AND_UNIQ = {"func": ("task-", "task"),
                                "anat": ("T", "Tw"),
                                "fmap": ("FM_", "dir"),
@@ -129,6 +131,16 @@ class ColHeaderFactory(Debuggable):
     def __init__(self, debugging: bool = False, will_add_run: bool = False,
                  dtype: Optional[str] = None, run_col: Optional[str] = "run",
                  uniq_col: Optional[str] = None) -> None:  #, prefix: Optional[str] = ""
+        """
+        _summary_ 
+        :param debugging: True to pause & interact on error or False to crash
+        :param will_add_run: True to include run number in column headers; 
+                             otherwise (and by default) False
+        :param dtype: Optional[str], data type, a key in DTYPE_2_UNIQ_COLS.
+                      Exclude it to create dtype-agnostic column headers.
+        :param run_col: Optional[str],_description_, defaults to "run"
+        :param uniq_col: Optional[str],_description_, defaults to None
+        """
         self.will_add_run = will_add_run
         self.debugging = debugging
         self.dtype = dtype
@@ -139,24 +151,33 @@ class ColHeaderFactory(Debuggable):
                 self.get_prefix_and_uniq_col_name_from(dtype)
         else:
             self.prefix = ""
-        # if prefix:
-        #     self.prefix = prefix
         if uniq_col:
             self.uniq_col = uniq_col
 
 
     def add_run_to(self, hdr_base: str, run_num: float) -> str:
+        """
+        :param hdr_base: str to append run number onto
+        :param run_num: float, run number (preferably a positive integer)
+        :return: str, hdr_base + "_run-" + 2-digit (0-padded) run_num, or
+                 just hdr_base if run_num is NaN
+        """
         try:
-            result=(hdr_base if float_is_nothing(run_num) else
+            return (hdr_base if float_is_nothing(run_num) else
                     hdr_base + stringify_run_num(run_num))
-            return result
         except ValueError as e:
             self.debug_or_raise(e, locals())
 
 
     def get_all_for(self, dtype: Optional[str] = None,
-                    df: Optional[pd.DataFrame] = None,
-                    include_NaNs: bool = False) -> Set[str]:
+                    df: Optional[pd.DataFrame] = None) -> Set[str]:
+        """
+        :param dtype: Optional[str], data type, a key in DTYPE_2_UNIQ_COLS.
+                      Exclude it to either use the dtype string given at
+                      instantiation or create dtype-agnostic column headers.
+        :param df: pd.DataFrame to get data from to create column header
+        :return: Set[str] of all BidsDB.df column header strings for dtype
+        """
         headers = set()
         if not dtype:
             dtype = self.dtype
@@ -182,10 +203,10 @@ class ColHeaderFactory(Debuggable):
                            df: Optional[pd.DataFrame] = None) -> Set[str]:
         """
         Annoyingly, this is ~20x slower than get_all_for despite seeming
-        much more elegant than a triply nested for loop.
+        much more elegant than get_all_for's triply nested for loop.
         :param dtype: Optional[str],_description_, defaults to None
         :param df: Optional[pd.DataFrame],_description_, defaults to None
-        :return: Set[str], _description_
+        :return: Set[str] of all BidsDB.df column header strings for dtype
         """
         headers = set()
         if not dtype:
@@ -203,12 +224,27 @@ class ColHeaderFactory(Debuggable):
 
 
     @classmethod
-    def get_prefix_and_uniq_col_name_from(cls, dtype: str):
+    def get_prefix_and_uniq_col_name_from(cls, dtype: str) -> Tuple[str]:
+        """
+        Given a dtype, get both of the other variables needed to make a
+        BidsDB.df column header: the header prefix and the name of the
+        BidsDB.df column with values uniquely identifying each row
+        :param dtype: str, data type, a key in DTYPE_2_UNIQ_COLS
+        :return: Tuple[str] with 2 elements: [0] prefix and [1] uniq_col.
+        """
         return cls.DTYPE_2_PREFIX_AND_UNIQ.get(dtype, ("", "")) 
 
 
     def new_from_row(self, row: pd.Series, uniq_col: Optional[str] = None,
                      include_non_run: bool = False) -> str:
+        """
+        _summary_ 
+        :param row: pd.Series, _description_
+        :param uniq_col: Optional[str],_description_, defaults to None
+        :param include_non_run: True to return a column header string even if
+                                row has no run number; else (by default) False
+        :return: str, _description_
+        """
         if not uniq_col:
             uniq_col = self.uniq_col
         # insert Diffusion or fMRI based on acq-[func/dwi] in the filename 
@@ -227,12 +263,12 @@ class ColHeaderFactory(Debuggable):
         else:
             hdr = None
         return hdr
-        # if hdr == "" and self.debugging: pdb.set_trace()
 
 
 class DataFrameQuery(Debuggable):
     def __init__(self) -> None:
         pass  # Unused so calling DataFrameQuery(...) returns a pd.DataFrame
+
 
     def __new__(self, df: pd.DataFrame, will_clean: bool = False,
                 **conditions: Any) -> pd.DataFrame:
@@ -257,10 +293,13 @@ class DataFrameQuery(Debuggable):
             self.clean()
         return self.df
    
+
     def add(self, col_name: str, col_value: Any) -> None:
         """
-        :param col_name: String naming a column of self.df to filter. If it's
-        :param col_value: str, _description_
+        The pd.DataFrame returned from calling this DataFrameQuery will only
+        include rows with a {col_name} value of {col_value}.
+        :param col_name: String naming a column or index of self.df to filter
+        :param col_value: Any value to find in self.df  
         """
         if col_name in self.df.index.names:
             col_value = f"'{col_value}'"
@@ -268,11 +307,11 @@ class DataFrameQuery(Debuggable):
             col_name = f"`{col_name}`"
         self.conditions.append(f"{col_name} == {col_value}")
 
-    def clean(self) -> None:  # , df: pd.DataFrame) -> pd.DataFrame:
+
+    def clean(self) -> None:
         """
-        :param df: pd.DataFrame, BidsDB.df
-        :return: pd.DataFrame, df transposed without Nones or NaNs to be
-                 convenient and readable 
+        Transpose self.df and remove its Nones/NaNs so it becomes more
+        convenient and readable, especially in pdb.set_trace calls
         """
         df = self.df.T
         self.df = df[~df.isna()]
@@ -324,6 +363,11 @@ def dt_format(moment: datetime) -> str:
 
 
 def fill_run(ser):
+    """
+    _summary_ 
+    :param ser: _type_, _description_
+    :return: _type_, _description_
+    """
     run_nums = ser.dropna()
     if not run_nums.empty:
         if run_nums.shape[0] == 1:
@@ -379,6 +423,12 @@ def get_ERI_filepath(bids_dir_path: str) -> str:
 
 
 def get_tier1_or_tier2_ERI_db_fname(parent_dir: str, tier: int) -> str:
+    """
+    :param parent_dir: str, path to directory with an ERI database file
+    :param tier: int, 1 to mean local storage (particularly MSI NGDR) or 2 to
+                 mean cloud storage (particularly AWS s3)
+    :return: str, path to database of EventRelatedInformation file paths
+    """
     return os.path.join(parent_dir, f"ERI_tier{tier}_paths_bids_db.csv")
 
 
@@ -418,11 +468,21 @@ def invert_dict(a_dict: Dict[Hashable, Hashable],
     return new_dict
     
 
-
-class ImgDscColNameSwapper:  # (Debuggable):  # (LazyDict): 
+class ImgDscColNameSwapper:  # (LazyDict, Debuggable): 
     def __init__(self, json_fpath: Optional[str] = None) -> None:
+        """
+        Class to create image_description strings, create BidsDB.df header
+        column strings, and convert one into the other. Each image_description
+        is a substring of `ftq_series_id`s in the FastTrackQC spreadsheet:
+        everything between the subject/session IDs and the date-time-stamp.
+        :param json_fpath: Optional[str], valid path to existing .JSON file
+        """
+        # Read in the .JSON file mapping FastTrackQC image_description strings
+        # to names of their respective final BidsDB.df column header strings
         self.fpath = self.find_fpath(json_fpath)
         self.dsc2hdr = extract_from_json(self.fpath)
+
+        # Map column header names to image_description strings
         self.hdr2dsc = invert_dict(self.dsc2hdr,
                                    keep_collision=True)
         self.hdr2dsc.pop(None, None)
@@ -433,15 +493,17 @@ class ImgDscColNameSwapper:  # (Debuggable):  # (LazyDict):
                            "FM": "fmap", "dwi": "dwi"}
         SPLIT_BY = re.compile("-|_")  # image_description delimiters
         for dsc, hdr in self.dsc2hdr.items():
-            
             self.dtype_of[hdr] = HDR_PFX_2_DTYPE.get(SPLIT_BY.split(hdr, 1)[0]
                                                      ) if hdr else None
-            # self.dtype_of[hdr] = (HDR_PFX_2_DTYPE.get(hdr.split("-", 1)[0], None)
-                                  # if hdr else None)  # self.hdr_col_to_dtype(hdr)
             self.dtype_of[dsc] = self.dtype_of[hdr]
 
-    # TODO Make this a cli_args parameter?
+
     def find_fpath(self, json_fpath: Optional[str] = None) -> str:
+        """
+        :param json_fpath: Optional[str], .JSON file path if provided
+        :return: str, valid path to existing .JSON file mapping FastTrackQC
+                 image_descriptions to their BidsDB.df column headers
+        """
         to_check = list()
         if json_fpath:
             dir_to_check, fname = os.path.split(json_fpath)
@@ -453,14 +515,28 @@ class ImgDscColNameSwapper:  # (Debuggable):  # (LazyDict):
                      os.path.dirname(__file__), os.getcwd()]
         return search_for_readable_file(fname, *to_check)
         
-    def to_header_col(self, image_description: str) -> str:
-        return self.dsc2hdr.get(image_description)
+
+    def to_header_col(self, img_desc: str) -> str:
+        """
+        :param img_desc: str, image_description from FastTrackQC spreadsheet;
+        :return: str, header column in final BidsDB.df
+        """
+        return self.dsc2hdr.get(img_desc)
     
+
     def to_image_desc(self, header_col_name: str) -> str:
+        """
+        :param header_col_name: str, header column in final BidsDB.df
+        :return: str, image_description from FastTrackQC spreadsheet
+        """
         return self.hdr2dsc.get(header_col_name)
 
 
 def iter_attr(an_obj: Any) -> Generator[str, None, None]:
+    """
+    Iterate over an object's attributes. Convenience function for debugging.
+    :yield: Generator[str, None, None] to iterate over an_obj attributes
+    """
     try:
         iterator = iter(an_obj)
     except TypeError:
@@ -491,6 +567,7 @@ class LazyDict(dict):
         """
         return self.__getitem__(__name)
     
+
     def __setattr__(self, __name: str, __value: Any) -> None:
         """
         For convenience, set items as object attributes.
@@ -498,6 +575,7 @@ class LazyDict(dict):
         :param __value: Object (any) to store in this instance
         """
         self.__setitem__(__name, __value)
+
 
     def lazyget(self, key: Hashable, get_if_absent:
                 Optional[Callable] = lambda: None) -> Any:
@@ -509,6 +587,7 @@ class LazyDict(dict):
         """
         return self[key] if self.get(key) is not None else get_if_absent()
     
+
     def lazysetdefault(self, key: Hashable, get_if_absent:
                        Optional[Callable] = lambda: None) -> Any:
         """
@@ -525,6 +604,9 @@ class LazyDict(dict):
 
 
 def is_nan(thing: Any) -> bool:
+    """
+    :return: True if thing is np.nan (NaN), otherwise False, raising no error
+    """
     try:
         thing_is_nan = np.isnan(thing)
     except TypeError:
@@ -533,7 +615,9 @@ def is_nan(thing: Any) -> bool:
 
 
 def float_is_nothing(thing: Optional[float]) -> bool:
-    # return True if thing in {None, np.nan} else not thing
+    """
+    :return: True if thing is falsy or NaN, otherwise False
+    """
     return thing is None or is_nan(thing) or not thing
 
 
@@ -548,14 +632,29 @@ def load_matrix_from(matrix_path: str):
 
 
 def log(msg: str, level: int = logging.INFO):
+    """
+    _summary_ 
+    :param msg: str, _description_
+    :param level: int,_description_, defaults to logging.INFO
+    """
     SplitLogger.logAtLevel(level, msg)
 
 
 def stringify_run_num(run_num: Union[int, float]) -> str:
+    """
+    :param run_num: Union[int, float], run number (ideally positive integer)
+                    to turn into a string
+    :return: str, "_run-" + 2-digit (0-padded) run_num
+    """
     return f"_run-{int(run_num):02d}"
     
 
 def make_default_out_file_name(key_DB: str):
+    """
+    _summary_ 
+    :param key_DB: str, _description_
+    :return: _type_, _description_
+    """
     return f"{key_DB}_BIDS_DB_{dt_format(datetime.now())}.tsv"
 
 
@@ -577,19 +676,37 @@ def make_ERI_filepath(parent: str, subj_ID: str, session: str, task: str,
 
 def mutual_reindex(*dfs: pd.DataFrame, fill_value:
                    Optional[Hashable] = np.nan) -> List[pd.DataFrame]:
-    # Combine all dataframes' indices so each has every subject session
+    """
+    This one DOES accept an empty dfs list.
+    Combine all dataframes' indices so each has every subject session, and
+    fill missing values (in 1 df but not the other) with np.nan (NaN) 
+    :param fill_value: Optional[Hashable],_description_, defaults to np.nan
+    :return: List[pd.DataFrame], the same dfs but now sharing indices, or
+             an empty list if no dfs were given 
+    """
     return mutual_reindex_dfs(*dfs, fill_value=fill_value
                               ) if len(dfs) > 1 else dfs
 
 
 def mutual_reindex_dfs(*dfs: pd.DataFrame, fill_value:
                        Optional[Hashable] = np.nan) -> List[pd.DataFrame]:
+    """
+    This one DOES NOT accept an empty dfs list.
+    Combine all dataframes' indices so each has every subject session, and
+    fill missing values (in 1 df but not the other) with np.nan (NaN) 
+    :param fill_value: Optional[Hashable],_description_, defaults to np.nan
+    :return: List[pd.DataFrame], the same dfs but now sharing indices
+    """
     combined_ixs = functools.reduce(lambda x, y: x.union(y),
                                     [df.index for df in dfs])
     return [df.reindex(combined_ixs, fill_value=fill_value) for df in dfs]
 
 
 def reformat_pGUID(pguid: str) -> str:
+    """
+    :param pguid: str, _description_
+    :return: str, now BIDS-valid subject ID
+    """
     uid_start = "INV"
     try:
         uid = pguid.split(uid_start, 1)[1]
@@ -611,15 +728,15 @@ class RegexForBidsDetails(LazyDict):
         "-subj": r"(?:sub-.*?)", # Exclude text from subj ID until next group
         "any": r"(.*?)",         # Get all text before the next capture group
         "acq": r"(?:acq-)?(.*?)",  # Get what's after "acq-" if it's present
-        "dir": r"(dir-.*?)",    # Get all text from "dir-" until next group
+        "dir": r"(dir-.*?)",     # Get all text from "dir-" until next group
         "nothing else": r"(?:.*)",  # Exclude everything from here onward
-        "rec": r"(rec-.*?)?",   # Get any text from "rec-" until next group
+        "rec": r"(rec-.*?)?",    # Get any text from "rec-" until next group
         "run": r"(?:run-)?([0-9]{2})?",  # Get 2-digit run number
-        "s3": r"(s3)?",         # Get the string "s3" if it's present
-        "ses": r"(ses-.*?)",    # Get all text from "ses-" until next group
+        "s3": r"(s3)?",          # Get the string "s3" if it's present
+        "ses": r"(ses-.*?)",     # Get all text from "ses-" until next group
         "subj": r"(sub-NDARINV.{8})",  # Get all text from "sub-" until next
         "task": r"(?:task-)(.*?)",  # Get all text after "task-" until next
-        "tier1": r"(tier1)?",   # Get the string "tier1" if it's present
+        "tier1": r"(tier1)?",    # Get the string "tier1" if it's present
         "Tw": r"(?:T)([0-9]?)(?:\w.*)"  # Get the digit between T and w
     })
     FIND["-_?"] = FIND["-_"] + "?"  # Exclude underscore, if any is present
@@ -653,9 +770,15 @@ class RegexForBidsDetails(LazyDict):
                  "run", "-_?", "nothing else")
     })
 
+
     def __init__(self, *pattern_names: str) -> None:
+        """
+        This class is just somewhere to put all of the Regex patterns I use
+        without constantly rebuilding them every time I need to use them.
+        """
         for pattern in pattern_names:
             self[pattern] = self.create(*self.SPLIT.lazyget(pattern, list))
+
 
     def create(self, *args: str) -> re.Pattern:
         """
@@ -666,22 +789,28 @@ class RegexForBidsDetails(LazyDict):
 
 def explode_col(ser: pd.Series, re_patterns: RegexForBidsDetails, dtype: str,
                 debugging: bool = False) -> list:
+    """
+    _summary_ 
+    :param ser: pd.Series, _description_
+    :param re_patterns: RegexForBidsDetails, _description_
+    :param dtype: str, data type, a key in DTYPE_2_UNIQ_COLS
+    :param debugging: True to pause & interact on error or False to crash
+    :raises e: _description_
+    :return: list, _description_
+    """
     try:
         new_cols = DTYPE_2_UNIQ_COLS.get(dtype)
         num_new_cols = len(new_cols) if new_cols else None
         exploded = ser.str.findall(re_patterns[dtype]
                                    ).explode(ignore_index=True)
-        # exploded[exploded.isna()] = [''] * 5
         ixs_NaNs = exploded.isna()
         if ixs_NaNs.any():
-            # assert exploded[~ixs_NaNs].any()
-            # num_new_cols = len(exploded[~ixs_NaNs].iloc[0])
-            if not num_new_cols:  # is_nothing(num_new_cols):
+            if not num_new_cols:
                 num_new_cols = len(exploded[~ixs_NaNs].iloc[0])
             exploded[ixs_NaNs] = exploded[ixs_NaNs].apply(
                 lambda _: [np.nan] * num_new_cols
             )
-    except (AttributeError, KeyError, ValueError) as e:  # AssertionError, 
+    except (AttributeError, KeyError, ValueError) as e:
         if debugging:
             debug(e, locals())
         else:
@@ -746,6 +875,11 @@ def save_to_hash_map_table(sub_ses_df: pd.DataFrame, subj_col: str,
 
 
 def search_for_readable_file(fname: str, *dir_paths_to_search: str) -> str:
+    """
+    _summary_ 
+    :param fname: str, _description_
+    :return: str, _description_
+    """
     file_found_at = None
     to_search = [fname] + [os.path.join(dir_path, fname)
                            for dir_path in dir_paths_to_search]
@@ -759,7 +893,7 @@ def search_for_readable_file(fname: str, *dir_paths_to_search: str) -> str:
     return file_found_at
 
 
-def show_keys_in(a_dict: Mapping[str, Any],# log:Callable = print,
+def show_keys_in(a_dict: Mapping[str, Any],  # log: Callable = print,
                  what_keys_are: str = "Local variables",
                  level: int = logging.INFO) -> None:
     """
@@ -780,8 +914,10 @@ class ShowTimeTaken:
         self.doing_what = doing_what
         self.show = show
 
+
     def __call__(self):
         pass
+
 
     def __enter__(self):
         """
@@ -792,6 +928,7 @@ class ShowTimeTaken:
         self.start = datetime.now()
         return self
     
+
     def __exit__(self, exc_type: Optional[type] = None,
                  exc_val: Optional[BaseException] = None, exc_tb=None):
         """
@@ -803,11 +940,10 @@ class ShowTimeTaken:
         """
         self.elapsed = datetime.now() - self.start
         self.show(f"\nTime elapsed {self.doing_what}: {self.elapsed}")
-        # if any((exc_type, exc_val, exc_tb)):
-        #     exc_type(exc_val, exc_tb)  #?
 
 
-class SplitLogger(logging.getLoggerClass()):  # 
+class SplitLogger(logging.getLoggerClass()): 
+    # Container class for message-logger and error-logger ("split" apart)
     FMT = "\n%(levelname)s %(asctime)s: %(message)s"
     LVL = LazyDict(OUT={logging.DEBUG, logging.INFO},
                    ERR={logging.CRITICAL, logging.ERROR, logging.WARNING})
@@ -866,7 +1002,8 @@ class SplitLogger(logging.getLoggerClass()):  #
 def stringify_list(a_list: list) -> str:
     """ 
     :param a_list: List (any)
-    :return: String of all items in a_list, single-quoted and comma-separated
+    :return: String containing all items in a_list, single-quoted and
+             comma-separated if there are multiple
     """
     result = ""
     if a_list and isinstance(a_list, list):
@@ -879,6 +1016,10 @@ def stringify_list(a_list: list) -> str:
 
 
 def checkout(df):
+    """
+    Convenience function for debugging 
+    :param df: _type_, _description_
+    """
     if df.empty:
         log(df.index.values)
     elif df.shape[0] > 1:# and not df[df["image_description"]=="ABCD-rsfMRI"].empty:

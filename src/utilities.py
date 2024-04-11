@@ -3,7 +3,7 @@
 """
 Utilities for ABCC auditing workflow
 Originally written by Anders Perrone
-Updated by Greg Conan on 2024-04-03
+Updated by Greg Conan on 2024-04-10
 """
 # Standard imports
 import argparse
@@ -21,7 +21,7 @@ import re
 import subprocess as sp
 import sys
 from typing import (Any, Dict, Generator, Iterable, List,  # Literal, 
-                    Mapping, Optional, Tuple, Union)
+                    Mapping, Optional, Set, Union)  # Tuple, 
 
 # External (pip/PyPI) imports
 import boto3
@@ -118,6 +118,118 @@ class Debuggable:
             raise an_err
 
 
+class ColHeaderFactory(Debuggable):
+    DTYPE_2_PREFIX_AND_UNIQ = {"func": ("task-", "task"),
+                               "anat": ("T", "Tw"),
+                               "fmap": ("FM_", "dir"),
+                               "dwi":  ("", "dwi")} # "dtype" -> uniq_col with only 1 value
+    ACQ_2_FM = {"func": "fMRI_", "dwi": "Diffusion_"}
+    
+
+    def __init__(self, debugging: bool = False, will_add_run: bool = False,
+                 dtype: Optional[str] = None, run_col: Optional[str] = "run",
+                 uniq_col: Optional[str] = None) -> None:  #, prefix: Optional[str] = ""
+        self.will_add_run = will_add_run
+        self.debugging = debugging
+        self.dtype = dtype
+        self.run_col = run_col
+        
+        if dtype:  # and ((not prefix) or (not uniq_col)):
+            self.prefix, self.uniq_col = \
+                self.get_prefix_and_uniq_col_name_from(dtype)
+        else:
+            self.prefix = ""
+        # if prefix:
+        #     self.prefix = prefix
+        if uniq_col:
+            self.uniq_col = uniq_col
+
+
+    def add_run_to(self, hdr_base: str, run_num: float) -> str:
+        try:
+            result=(hdr_base if float_is_nothing(run_num) else
+                    hdr_base + stringify_run_num(run_num))
+            return result
+        except ValueError as e:
+            self.debug_or_raise(e, locals())
+
+
+    def get_all_for(self, dtype: Optional[str] = None,
+                    df: Optional[pd.DataFrame] = None,
+                    include_NaNs: bool = False) -> Set[str]:
+        headers = set()
+        if not dtype:
+            dtype = self.dtype
+        if not df_is_nothing(df):
+            prefix, uniq_col = self.get_prefix_and_uniq_col_name_from(dtype)
+
+            runs = df[self.run_col].unique()
+            
+            uniqs = [dtype] if uniq_col == "dwi" else df[uniq_col].unique()
+            acqs = df["acq"].unique() if dtype == "fmap" else [""]
+
+            for uniq in uniqs:
+                for acq in acqs:
+                    hdr_base = f"{prefix}{self.ACQ_2_FM.get(acq, '')}{uniq}"
+                    for run in runs:
+                        headers.add(self.add_run_to(hdr_base, run))
+                        
+        headers.discard(np.nan)
+        return headers
+
+
+    def get_all_simply_for(self, dtype: Optional[str] = None,
+                           df: Optional[pd.DataFrame] = None) -> Set[str]:
+        """
+        Annoyingly, this is ~20x slower than get_all_for despite seeming
+        much more elegant than a triply nested for loop.
+        :param dtype: Optional[str],_description_, defaults to None
+        :param df: Optional[pd.DataFrame],_description_, defaults to None
+        :return: Set[str], _description_
+        """
+        headers = set()
+        if not dtype:
+            dtype = self.dtype
+        if not df_is_nothing(df):
+            uniq_cols = DTYPE_2_UNIQ_COLS.get(dtype)
+            if dtype == "anat":
+                uniq_cols = uniq_cols[1:]
+
+            df_1_row_per_hdr = df.groupby(uniq_cols).head(1)
+            headers = set(df_1_row_per_hdr.apply(self.new_from_row, axis=1))
+
+        headers.discard(np.nan)
+        return headers
+
+
+    @classmethod
+    def get_prefix_and_uniq_col_name_from(cls, dtype: str):
+        return cls.DTYPE_2_PREFIX_AND_UNIQ.get(dtype, ("", "")) 
+
+
+    def new_from_row(self, row: pd.Series, uniq_col: Optional[str] = None,
+                     include_non_run: bool = False) -> str:
+        if not uniq_col:
+            uniq_col = self.uniq_col
+        # insert Diffusion or fMRI based on acq-[func/dwi] in the filename 
+        acq_hdr = (self.ACQ_2_FM.get(row.get("acq", ""), "")
+                   if row.get("dtype") == "fmap" else "")
+        hdr_base = f"{self.prefix}{acq_hdr}{row.get(uniq_col, '')}"
+
+        # Add run number if the row has one
+        run = row.get(self.run_col)
+        if not float_is_nothing(run):
+            hdr = hdr_base + stringify_run_num(run)
+
+        # If it doesn't, return what the caller specified via include_non_run
+        elif include_non_run:
+            hdr = hdr_base
+        else:
+            hdr = None
+        return hdr
+        # if hdr == "" and self.debugging: pdb.set_trace()
+
+
 class DataFrameQuery(Debuggable):
     def __init__(self) -> None:
         pass  # Unused so calling DataFrameQuery(...) returns a pd.DataFrame
@@ -138,7 +250,7 @@ class DataFrameQuery(Debuggable):
         try:
             for col_name, col_value in conditions.items():
                 self.add(self, col_name, col_value)
-        except TypeError as e:
+        except (TypeError) as e:
             self.debug_or_raise(self, e, locals())
         self.df.query(" & ".join(self.conditions), inplace=True)
         if will_clean:
@@ -221,34 +333,6 @@ def fill_run(ser):
     return ser
 
 
-def get_col_headers_for(dtype: str, df: Optional[pd.DataFrame] = None) -> set:
-    """
-    :param dtype: str, data type, a key in DTYPE_2_UNIQ_COLS
-    :param df: pd.DataFrame to get column headers from, or None
-    :return: Set[str] of column headers made from df columns, or empty set
-    """
-    # headers = set(headers) if headers else set()
-    headers = set()
-    prefix, uniq_col = get_header_vars_for(dtype)
-    if not df_is_nothing(df):
-        # loops = range(10)
-        # with ShowTimeTaken("getting headers with a double for loop"):  
-        #     for _ in loops:  
-        headers = set()  # Block ran in 0:00:00.000513
-        runs = df["run"].unique()
-        uniqs = [dtype] if uniq_col == "dtype" else df[uniq_col].unique()
-        for run in runs:
-            for uniq in uniqs:
-                headers.add(make_col_header(f"{prefix}{uniq}", run))
-        # with ShowTimeTaken('using groupby'): headers = set(df.groupby(['run', uniq_col]).apply(lambda df: make_col_header(f"{prefix}{df.iloc[0][uniq_col]}", df.iloc[0].run)))  # Line ran in 0:00:00.006132
-        # with ShowTimeTaken("getting headers with pd.apply"):
-            # headers = np.apply_along_axis(arr=df[["run", uniq_col]].value_counts().index, func1d=lambda pair: make_col_header(f"{prefix}{pair[uniq_col]}"), axis=0)
-        # with ShowTimeTaken('using drop_duplicates'): print(set(df.drop_duplicates(subset=['run', uniq_col]).apply(lambda row: make_col_header(f"{prefix}{row.get(uniq_col):.0f}", row.get("run")), axis=1)))  # Line ran in 0:00:00.002146
-    if np.nan in headers:
-        headers -= {np.nan}
-    return headers
-
-
 def get_most_recent_FTQC_fpath(incomplete_dirpath_FTQC: str) -> str:
     """
     :param incomplete_dirpath_FTQC: Fast Track QC directory paths with "{}"
@@ -292,14 +376,6 @@ def get_ERI_filepath(bids_dir_path: str) -> str:
     return build_NGDR_fpath(os.path.join(bids_dir_path, "sourcedata"),
                             "func", "task-*_run-*_bold_"
                             "EventRelatedInformation.txt")
-
-
-def get_header_vars_for(dtype: str) -> Tuple[str]:
-    return {"func":      ("task-", "task"),
-            "anat":      ("T", "Tw"),
-            "fmap":      ("FM_", "dir"),
-            "dwi":       ("", "dtype") # "dtype" -> uniq_col with only 1 value
-            }.get(dtype, ("", ""))
 
 
 def get_tier1_or_tier2_ERI_db_fname(parent_dir: str, tier: int) -> str:
@@ -448,9 +524,17 @@ class LazyDict(dict):
     #     return LazyDict({key: self.get(key) for key in keys})
 
 
+def is_nan(thing: Any) -> bool:
+    try:
+        thing_is_nan = np.isnan(thing)
+    except TypeError:
+        thing_is_nan = False
+    return thing_is_nan
+
+
 def float_is_nothing(thing: Optional[float]) -> bool:
     # return True if thing in {None, np.nan} else not thing
-    return thing is None or np.isnan(thing) or not thing
+    return thing is None or is_nan(thing) or not thing
 
 
 def load_matrix_from(matrix_path: str):
@@ -467,36 +551,8 @@ def log(msg: str, level: int = logging.INFO):
     SplitLogger.logAtLevel(level, msg)
 
 
-def make_col_header(prefix: str, run_num: Optional[float] = None,  # run_num=1
-                    debugging: bool = False) -> str:
-    try:  
-        if float_is_nothing(run_num):  # run_num is None or np.isnan(run_num):  # is_nothing(run_num):
-            header = np.nan  # prefix  # run_num = 1  # TODO Figure out what to do with rows with bad QC (& therefore no run numbers), by asking or by comparing with the original abcd-dicom2bids audit script(s)
-        else:
-            header = f"{prefix}_{run_num_to_str(run_num)}"
-        return header  # return f"{prefix}_{run_num_to_str(run_num)}"
-                # if isnt_nothing(run_num) else prefix)  # TODO Ensure run number added?
-    except ValueError as e:
-        if debugging:
-            debug(e, locals())
-        else:
-            raise e
-
-
-def make_col_header_from(row: pd.Series, dtype: str, uniq=None,
-                         debugging: bool = False) -> str:
-    if uniq:
-        uniq_col = uniq
-        prefix, _ = get_header_vars_for(dtype)
-    else:
-        prefix, uniq_col = get_header_vars_for(dtype)
-    try:
-        return make_col_header(f"{prefix}{row.get(uniq_col)}", row.get("run"))
-    except ValueError as e:
-        if debugging:
-            debug(e, locals())
-        else:
-            raise e
+def stringify_run_num(run_num: Union[int, float]) -> str:
+    return f"_run-{int(run_num):02d}"
     
 
 def make_default_out_file_name(key_DB: str):
@@ -516,7 +572,7 @@ def make_ERI_filepath(parent: str, subj_ID: str, session: str, task: str,
     """
     return os.path.join(parent, "sourcedata", subj_ID, session, "func",
                         f"{subj_ID}_{session}_task-{task}_run-{run}_bold_"
-                        "EventRelatedInformation.txt")
+                        "EventRelatedInformation.txt")  # {task}{stringify_run_num(run)}_
 
 
 def mutual_reindex(*dfs: pd.DataFrame, fill_value:
@@ -531,12 +587,6 @@ def mutual_reindex_dfs(*dfs: pd.DataFrame, fill_value:
     combined_ixs = functools.reduce(lambda x, y: x.union(y),
                                     [df.index for df in dfs])
     return [df.reindex(combined_ixs, fill_value=fill_value) for df in dfs]
-
-
-def reformat_BIDS_df_col(col: pd.Series) -> pd.Series:
-    reformatters = {"rec-normalized": bool, "Tw": int,
-                    "run": lambda x: float(x) if x != "" else np.nan}
-    return col.apply(reformatters.get(col.name, lambda x: x))
 
 
 def reformat_pGUID(pguid: str) -> str:
@@ -646,10 +696,6 @@ def extract_from_json(json_path: str) -> Dict:
     """
     with open(json_path, 'r') as infile:
         return json.load(infile)
-
-
-def run_num_to_str(run_num:Optional[float] = 1):
-    return f"run-{int(run_num):02d}"
 
 
 def s3_get_info() -> LazyDict:

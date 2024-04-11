@@ -4,7 +4,7 @@
 ABCC Audit BIDS DB Object Classes
 Greg Conan: gregmconan@gmail.com
 Created: 2024-01-18
-Updated: 2024-04-03
+Updated: 2024-04-09
 """
 # Standard imports
 import functools
@@ -22,12 +22,11 @@ import pandas as pd
 
 # Local imports
 from src.utilities import (
-    build_NGDR_fpath, build_summary_str, DataFrameQuery, Debuggable,
-    df_is_nothing, DTYPE_2_UNIQ_COLS, explode_col, get_col_headers_for,
+    build_NGDR_fpath, build_summary_str, ColHeaderFactory, DataFrameQuery,
+    Debuggable, df_is_nothing, DTYPE_2_UNIQ_COLS, explode_col,
     ImgDscColNameSwapper, invert_dict, float_is_nothing, LazyDict,
-    make_col_header, make_col_header_from, make_default_out_file_name,
-    mutual_reindex, reformat_BIDS_df_col, RegexForBidsDetails, ShowTimeTaken,
-    WHICH_DBS
+    make_default_out_file_name, mutual_reindex, RegexForBidsDetails,
+    ShowTimeTaken, WHICH_DBS
 )
 
 # Constants:
@@ -102,8 +101,10 @@ class BidsDBColumnNames(LazyDict, Debuggable):
         self.ID.lazysetdefault("non", self.get_non_ID_cols)
 
 
-    def lazyget_all(self) -> Iterable[str]:
-        return self.lazysetdefault("all", lambda: self.df.columns.values)
+    def lazyget_all(self, df: Optional[pd.DataFrame] = None) -> Iterable[str]:
+        if df is None:
+            df = self.get("df")
+        return self.lazysetdefault("all", lambda: df.columns.values)
 
 
     def get_non_ID_cols(self) -> pd.Series:
@@ -135,6 +136,134 @@ class BidsDBColumnNames(LazyDict, Debuggable):
         return self.df
 
 
+class BidsDBDetailsForType(Debuggable):
+    REFORMATTERS = {"rec-normalized": bool, "Tw": int,
+                    "run": lambda x: float(x) if x != "" else np.nan}
+
+    def __init__(self, dtype: str, df: pd.DataFrame, col_to_keep: str,
+                 db_COLS: BidsDBColumnNames, from_FTQC: bool,
+                 drop_NaN_from: Optional[Iterable[str]] = list(),
+                 debugging: bool = False) -> None:
+        """
+        :param df: pd.DataFrame with a column named self.COLS.fname of file
+                   name/path strings to split into new columns if not from_FTQC
+        :param dtype: str, data type, a key in DTYPE_2_UNIQ_COLS
+        :param col_to_get: String naming the column of the BidsDB pd.DataFrame
+                           to keep values from in the final pd.DataFrame
+        :param db_COLS: BidsDBColumnNames, _description_
+        """
+        self.COLS = db_COLS
+        self.col_to_keep = col_to_keep
+        self.debugging = debugging
+        self.df = df
+        self.dtype = dtype
+
+        # Build "factory" object ready to create all column headers
+        specifier = (dict(uniq_col=self.COLS.hdr) if from_FTQC else
+                     dict(dtype=dtype))
+        self.hdr_mkr = ColHeaderFactory(debugging=debugging,
+                                        will_add_run=True, **specifier,
+                                        run_col=self.COLS.run)
+        
+        if from_FTQC:
+            self.add_header_col()
+            self.COLS[dtype] = set(self.df[self.COLS.hdr].dropna().unique())
+        else:
+            self.make_df_from_fpaths()
+            
+            self.COLS[dtype] = self.hdr_mkr.get_all_for(df=self.df)
+
+        # Remove any rows containing NaN in the drop_NaN_from column(s)
+        if drop_NaN_from:
+            self.df.dropna(subset=drop_NaN_from, inplace=True)
+        # if dtype == "anat":
+        if not from_FTQC:
+            self.df.loc[self.df[self.COLS.run] == "", self.COLS.run] = 1
+            self.add_header_col()  # TODO ?
+
+
+    def add_header_col(self) -> Dict[str, pd.DataFrame]:
+        """
+        :param dfs_BIDS: Dict[str, pd.DataFrame] mapping each data type str
+                         ("anat", "func", etc) to pd.DataFrame of data from
+                         files with that data type
+        :return: dict, dfs_BIDS but with a new column in its pd.DataFrame
+                 values: the column header in the final self.df
+        """
+        self.df[self.COLS.hdr] = \
+            self.df.apply(self.hdr_mkr.new_from_row, axis=1)
+        
+
+    def make_df_from_fpaths(self):  # , *drop_NaN_from: str):
+        """
+        Split filenames into new columns with all relevant details for its dtype
+        :param drop_NaN_from: Iterable[str], names of columns to drop NaNs from
+        """
+        try:
+            dtype_ID_COLS = self.COLS.ID.get(self.dtype)
+            if float_is_nothing(self.df.get(dtype_ID_COLS)):
+                self.df[dtype_ID_COLS] = explode_col(self.df[self.COLS.fname],
+                                                     RGX_SPLIT, self.dtype)
+            assert not df_is_nothing(self.df)
+        except (AssertionError, AttributeError, KeyError, ValueError) as e:
+            self.debug_or_raise(e, locals())
+
+
+    def make_final_df(self) -> pd.DataFrame:
+        """
+        Given a dataframe with one BIDS file per line, where each has its own
+        subject/session *and* its own task/run/etc., restructure it to store
+        data by subject-session instead of by file. Makes final output df 
+        :param col_to_get: str, column of df to store values from in output df
+        :param df: pd.DataFrame, DataFrame with one row per file
+        :param dtype: str, data type, a key in DTYPE_2_UNIQ_COLS
+        :return: pd.DataFrame, df with one subject-session per row and new
+                 columns for every different value in the "header" column
+        """
+        try:
+            sub_ses_dict_cols = self.COLS[self.dtype]
+            # sub_ses_dict_cols = self.COLS.lazyget(self.dtype, lambda: self.df[self.COLS.hdr].unique())
+        except (AttributeError, KeyError) as e:
+            self.debug_or_raise(e, locals())
+        # sub_ses_dict_cols = self.COLS.dtype  # self.df[self.COLS.hdr].unique() if self.COLS.hdr in self.df else 
+        dicts_for_df = self.df.groupby(self.COLS.ID.sub_ses).apply(
+            lambda sub_ses_df: self.make_subj_ses_dict(
+                sub_ses_df, sub_ses_dict_cols
+            )
+        )
+        final_df = pd.DataFrame(dicts_for_df.values.tolist(),
+                                columns=[*self.COLS.ID.sub_ses,
+                                         *sub_ses_dict_cols])  # *self.COLS.dtype])
+        if self.debugging:
+            pdb.set_trace()
+        return final_df.dropna(how="all", axis=1)
+        
+
+
+    def make_subj_ses_dict(self, a_df: pd.DataFrame, dict_cols: Iterable[str]
+                           ) -> Dict[str, Any]:
+        """
+        :param a_df: pd.DataFrame with the same ID in each row in its subject
+                     column and the same ID in each row in its session column
+        :param dict_cols: Iterable[str] of a_df column names to return as keys
+        :return: Dict[str, Any] mapping dict_cols to their values in a_df
+        """
+        sub_ses_dict = {col: None for col in dict_cols}
+        if not a_df.empty:
+            for col_ID in self.COLS.ID.sub_ses:
+                sub_ses_dict[col_ID] = a_df[col_ID].iloc[0]
+            def add_to_sub_ses_dict(row):
+                sub_ses_dict[row.get(self.COLS.hdr)] = \
+                    row.get(self.col_to_keep)
+            a_df.apply(add_to_sub_ses_dict, axis=1)
+        return sub_ses_dict
+
+
+    @classmethod
+    def reformat_col(cls, col: pd.Series) -> pd.Series:
+        return col.apply(cls.REFORMATTERS.get(col.name, lambda x: x))
+
+
 class BidsDB(LazyDict, Debuggable):
     def __init__(self, in_files: Optional[Iterable[str]] = list(),
                  out_fpath: Optional[str] = None, df:
@@ -158,7 +287,7 @@ class BidsDB(LazyDict, Debuggable):
         elif in_files:
             self.df = self.read_df_from(*in_files)
         else:
-            self.debug_or_raise(ValueError("No DataFrame"), locals())
+            self.debug_or_raise(ValueError("No data provided"), locals())
 
         self.ensure_has_COLS(sub=sub_col, ses=ses_col, fname="image_file",
                              img2hdr_fpath=img2hdr_fpath, df=self.df)
@@ -173,25 +302,10 @@ class BidsDB(LazyDict, Debuggable):
         :return: String representing the DB dataframe and naming its columns
         """
         name = self.__class__.__name__
-        return  (f"{name}.COLS:\n\n{self.COLS.lazyget_all()}\n\n"
-                 f"{name}.df:\n{self.get('df')}")
+        df = self.get("df", None)
+        return  (f"{name}.COLS:\n\n{self.COLS.lazyget_all(df=df)}\n\n"
+                 f"{name}.df:\n{df}")
     __repr__ = __str__
-
-
-    def add_header_col_to(self, **dfs_BIDS: pd.DataFrame
-                          ) -> Dict[str, pd.DataFrame]:
-        """
-        :param dfs_BIDS: Dict[str, pd.DataFrame] mapping each data type str
-                         ("anat", "func", etc) to pd.DataFrame of data from
-                         files with that data type
-        :return: dict, dfs_BIDS but with a new column in its pd.DataFrame
-                 values: the column header in the final self.df
-        """
-        for dtype, eachdf in dfs_BIDS.items():
-            eachdf[self.COLS.hdr] = eachdf.apply(
-                lambda row: make_col_header_from(row, dtype), axis=1
-            )
-        return dfs_BIDS
 
 
     def ensure_has_COLS(self, sub: str, ses: str, **kwargs: Any) -> None:
@@ -207,29 +321,48 @@ class BidsDB(LazyDict, Debuggable):
             img_dsc="image_description", DT="datetimestamp",
             debugging=self.debugging, **kwargs  #  df=self.get("df"),
         )
-    
 
-    def explode_into_BIDS_df(self, df: pd.DataFrame, dtype: str,
-                             *dropNaN_from: str) -> pd.DataFrame:
+
+    def finalize_df(self, from_FTQC: bool, **dfs_BIDS: pd.DataFrame
+                    ) -> pd.DataFrame:
         """
-        Split filenames into new columns with all relevant details 
-        :param df: pd.DataFrame with a column named self.COLS.fname of file
-                   name/path strings to split into new columns
-        :param dtype: str, data type, a key in DTYPE_2_UNIQ_COLS
-        :param dropNaN_from: Iterable[str], names of columns to drop NaNs from
-        :return: pd.DataFrame with new columns named in self.COLS.ID[dtype]
+        :param paths_BIDS: Dict[str, pd.DataFrame] mapping dtype strings (keys
+                           from DTYPE_2_UNIQ_COLS) to pd.DataFrames with 1 row
+                           per file of that data type and 1 column (file path)
+        :return: pd.DataFrame, valid BidsDB.df with 1 subject session per row
+                 and 1 dtype-detail per column 
         """
-        try:
-            dtype_ID_COLS = self.COLS.ID.get(dtype)
-            if float_is_nothing(df.get(dtype_ID_COLS)):
-                df[dtype_ID_COLS] = explode_col(df[self.COLS.fname],
-                                                RGX_SPLIT, dtype)
-            if dropNaN_from:
-                df.dropna(subset=dropNaN_from, inplace=True)
-            assert not df_is_nothing(df)
-            return df
-        except (AssertionError, AttributeError, KeyError, ValueError) as e:
-            self.debug_or_raise(e, locals())
+        # Input parameters to create BidsDBDetailsForType objects for each 
+        # dtype depend on whether this BidsDB is FastTrack or Tier1/2
+        details = dict(db_COLS=self.COLS, debugging=self.debugging,
+                       from_FTQC=from_FTQC)
+        if from_FTQC:
+            details["col_to_keep"] = self.COLS.QC
+            details["drop_NaN_from"] = [self.COLS.hdr]
+        else:
+            details["col_to_keep"] = self.COLS.fname
+
+        # TODO add explanatory comment
+        non_ID_COLS = set()
+        details_for_dtype = list()
+        for dtype, df in dfs_BIDS.items():
+            details_for_dtype.append(BidsDBDetailsForType(
+                dtype=dtype, df=df, **details
+            ))
+            # self.COLS[dtype] = details_for_dtype[-1].COLS.dtype
+            non_ID_COLS.update(details_for_dtype[-1].COLS[dtype])
+
+        self.COLS.lazysetdefault("all", lambda: [*self.COLS.ID.sub_ses,
+                                                *non_ID_COLS])
+        self.COLS.ID.non = pd.Series(list(non_ID_COLS)) 
+        self.COLS.ID.non.sort_values(inplace=True)
+
+        # Collapse df so it has 1 row per subject session
+        new_dfs = [details.make_final_df() for details in details_for_dtype]
+
+        if self.debugging:
+            pdb.set_trace()
+        return self.merge_N_dfs(*new_dfs)
 
 
     def get_DB_df(self, make_df: Callable, in_fpath: Optional[str] = None,
@@ -251,67 +384,12 @@ class BidsDB(LazyDict, Debuggable):
         return df
 
 
-    def get_empty_BIDS_DB_DF(self, *_: Any) -> pd.DataFrame:
+    def get_empty_df(self, *_: Any) -> pd.DataFrame:
         """
         :return: pd.DataFrame, empty but with (some) valid anat and func
                  column names
         """
-        return pd.DataFrame(columns=[
-            "subject", "session", "T1_run-01", "T2_run-01", "task-rest_run-01",
-            "task-rest_run-02", "task-rest_run-03", "task-rest_run-04",
-            "task-MID_run-01", "task-MID_run-02", "task-SST_run-01",
-            "task-SST_run-02", "task-nback_run-01", "task-nback_run-02"
-        ])
-
-
-    def make_BIDS_files_dfs(self, **paths_BIDS: pd.DataFrame) -> pd.DataFrame:
-        """
-        :param paths_BIDS: Dict[str, pd.DataFrame] mapping dtype strings (keys
-                           from DTYPE_2_UNIQ_COLS) to pd.DataFrames with 1 row
-                           per file of that data type and 1 column (file path)
-        :return: pd.DataFrame, valid BidsDB.df with 1 subject session per row
-                 and 1 dtype-detail per column 
-        """
-        dfs_BIDS = dict()
-        non_ID_COLS = list()
-
-        # Split filepath string into columns of relevant details for its dtype
-        for dtype, pathsdf in paths_BIDS.items():
-            dfs_BIDS[dtype] = self.explode_into_BIDS_df(pathsdf, dtype).apply(
-                reformat_BIDS_df_col
-            )
-            try:
-                self.COLS[dtype] = get_col_headers_for(dtype, dfs_BIDS[dtype])
-            except KeyError as e:
-                self.debug_or_raise(e, locals())
-            non_ID_COLS += list(self.COLS[dtype])
-        self.COLS.lazysetdefault("all", lambda: [*self.COLS.ID.sub_ses,
-                                                 *non_ID_COLS])
-        self.COLS.ID.non = pd.Series(non_ID_COLS) 
-        dfs_BIDS = self.add_header_col_to(**dfs_BIDS)
-
-        # Collapse df so it has 1 row per subject session
-        return (self.transform_dfs_to_BIDS_DB(self.COLS.fname, **dfs_BIDS)
-                if dfs_BIDS else self.get_empty_BIDS_DB_DF())
-
-
-    def make_subj_ses_dict(self, a_df: pd.DataFrame, dict_cols: Iterable[str],
-                           value_col: str) -> Dict[str, Any]:
-        """
-        :param a_df: pd.DataFrame with 1 ID in its subject column and 1 in its
-                     session column
-        :param dict_cols: Iterable[str] of a_df column names to return as keys
-        :param value_col: String naming the a_df column to save values from
-        :return: Dict[str, Any] mapping dict_cols to their values in a_df
-        """
-        sub_ses_dict = {col: None for col in dict_cols}
-        if not a_df.empty:
-            for col_ID in self.COLS.ID.sub_ses:
-                sub_ses_dict[col_ID] = a_df[col_ID].iloc[0]
-            def add_to_sub_ses_dict(row):
-                sub_ses_dict[row.get(self.COLS.hdr)] = row.get(value_col)
-            a_df.apply(add_to_sub_ses_dict, axis=1)
-        return sub_ses_dict
+        return pd.DataFrame(columns=self.COLS.all)
 
 
     def merge_2_dfs_on_sub_ses(self, df_L: pd.DataFrame, df_R: pd.DataFrame
@@ -325,8 +403,28 @@ class BidsDB(LazyDict, Debuggable):
                         on=self.COLS.ID.sub_ses)
     
 
+    def merge_N_dfs(self, *dfs: pd.DataFrame) -> pd.DataFrame:
+        """
+        _summary_ 
+        :return: pd.DataFrame, _description_
+        """  # TODO Implement switch-case (finally) added in Python 3.10
+        n_dfs = len(dfs)
+        if n_dfs > 2:
+            final_df = functools.reduce(self.merge_2_dfs_on_sub_ses, dfs)
+        elif n_dfs == 2:
+            final_df = self.merge_2_dfs_on_sub_ses(*dfs)
+        elif n_dfs == 1:
+            final_df = dfs[0]
+        else:
+            final_df = self.get_empty_df()
+        return final_df
+    
+
     def query_get(self, **kwargs: Any) -> pd.DataFrame:
-        return DataFrameQuery(df=self.df, **kwargs)
+        try:
+            return DataFrameQuery(df=self.get("df"), **kwargs)
+        except TypeError as e:
+            self.debug_or_raise(e, locals())
 
 
     def read_df_from(self, *in_paths: str) -> pd.DataFrame:
@@ -378,7 +476,7 @@ class BidsDB(LazyDict, Debuggable):
             new_df = pd.DataFrame(
                 data=explode_col(df[self.COLS.fname], RGX_SPLIT, dtype),
                 columns=self.COLS.ID.sub_ses + DTYPE_2_UNIQ_COLS.get(dtype)
-            ) # columns=[x for x in RGX_SPLIT.SPLIT[df.dtype.unique()[0]] if x.isalpha()]))
+            )
         return new_df
     
 
@@ -394,76 +492,6 @@ class BidsDB(LazyDict, Debuggable):
             return {dtype: df.iloc[ixs] for dtype, ixs in dtype2ixs.items()}
         except KeyError as e:
             self.debug_or_raise(e, locals())
-
-
-    def transform_dfs_to_BIDS_DB(self, col_to_get: str, **dfs_BIDS:
-                                 pd.DataFrame) -> pd.DataFrame:
-        """
-        :param col_to_get: String naming the column of the current/old self.df
-                           to save values from in every column of the
-                           final/new self.df
-        :param dfs_BIDS: Dict[str, pd.DataFrame] mapping each data type str
-                         ("anat", "func", etc) to pd.DataFrame of data from
-                         files with that data type
-        :return: pd.DataFrame, final self.df with one subject-session per row
-        """
-        new_dfs = list()
-        if self.debugging:
-            pdb.set_trace()
-        for dtype, eachdf in dfs_BIDS.items():
-            new_dfs.append(self.transform_1_df_to_BIDS_DB(col_to_get, eachdf,
-                                                          dtype))  # new_dfs[dtype]=
-
-        """
-        return {1: next, 2: lambda dfs: self.merge_2_dfs_on_sub_ses(*dfs),
-                3: lambda dfs: functools.reduce(self.merge_2_dfs_on_sub_ses, dfs)
-        }.get(len(new_dfs), lambda _:
-              self.debug_or_raise(ValueError(), locals()))(new_dfs.values())
-        """
-        return self.merge_N_dfs(*new_dfs)
-    
-
-    def merge_N_dfs(self, *dfs: pd.DataFrame) -> pd.DataFrame:
-        """
-        _summary_ 
-        :return: pd.DataFrame, _description_
-        """  # TODO Implement switch-case (finally) added in Python 3.10
-        n_dfs = len(dfs)
-        if n_dfs > 2:
-            final_df = functools.reduce(self.merge_2_dfs_on_sub_ses, dfs)
-        elif n_dfs == 2:
-            final_df = self.merge_2_dfs_on_sub_ses(*dfs)
-        elif n_dfs == 1:
-            final_df = dfs[0]
-        else:
-            self.debug_or_raise(ValueError(), locals())  # TODO
-        return final_df
-
-
-    def transform_1_df_to_BIDS_DB(self, col_to_get: str, df: pd.DataFrame,
-                                  dtype: str) -> pd.DataFrame:
-        """
-        Given a dataframe with one BIDS file per line, where each has its own
-        subject/session *and* its own task/run/etc., restructure it to store
-        data by subject-session instead of by file. Makes final output df 
-        :param col_to_get: str, column of df to store values from in output df
-        :param df: pd.DataFrame, DataFrame with one row per file
-        :param dtype: str, data type, a key in DTYPE_2_UNIQ_COLS
-        :return: pd.DataFrame, df with one subject-session per row and new
-                 columns for every different value in the "header" column
-        """
-        with ShowTimeTaken(f"reformatting {self.__class__.__name__} "
-                           f"{dtype} dataframe"):
-            new_df = df.groupby(self.COLS.ID.sub_ses).apply(
-                lambda sub_ses_df: self.make_subj_ses_dict(
-                    sub_ses_df, self.COLS.lazysetdefault(
-                        dtype, sub_ses_df[self.COLS.hdr].unique
-                    ), col_to_get
-                )
-            )
-            return pd.DataFrame(new_df.values.tolist(),
-                                columns=[*self.COLS.ID.sub_ses,
-                                        *self.COLS[dtype]])
 
 
 class BidsDBToQuery(BidsDB):  # TODO
@@ -614,6 +642,8 @@ class FastTrackQCDB(BidsDB):
         
         # Entries with ftq_usable != 1 have no run number
         df.loc[~is_usable, self.COLS.run] = np.nan
+
+        # Remove anatomical entries 
         return df
 
 
@@ -633,59 +663,22 @@ class FastTrackQCDB(BidsDB):
         self.df[self.COLS.hdr] = self.df[self.COLS.img_dsc].apply(
             self.COLS.SWAPPER.to_header_col
         )
-        self.df.dropna(subset=[self.COLS.hdr], inplace=True)
         self.df["dtype"] = self.df[self.COLS.hdr
                                    ].apply(self.COLS.SWAPPER.dtype_of.get)
-        
-        # Remove ftq_usable==0 entries  # TODO: Or just add run numbers to ftq_usable==1 entries?
-        # self.df.drop(index=self.df[self.df[self.COLS.QC] == 0.0])
-        # self.df = self.df.loc[self.df[self.COLS.QC] == 1.0]
 
         # Add run numbers to header col
-        with ShowTimeTaken("adding run numbers to column headers"):
-            self.df = self.add_run_numbers_to(self.df)  # Get run numbers
-
-            if self.debugging:   # TODO Remove line?
-                pdb.set_trace()  # TODO Remove line?
-
-        # self.df['submission_id'] = self.df.image_file.str.findall(r'(?:.*?)(?:submission_)([0-9]*)(?:/NDAR)(?:.*)').explode(ignore_index=True)
-            
-        # self.df.dropna(subset=[self.COLS.hdr], inplace=True)
-            self.df[self.COLS.hdr] = self.df.apply(lambda row: make_col_header(
-                row.get(self.COLS.hdr), row.get(self.COLS.run)
-            ), axis=1)
-            self.df.dropna(subset=[self.COLS.hdr], inplace=True)
-            self.COLS["fname"] = "image_file"
+        self.df = self.add_run_numbers_to(self.df)  # Get run numbers
+        self.COLS["fname"] = "image_file"
         try:
-            self.df = self.make_BIDS_files_dfs_no_explode(
-                **self.split_into_dtype_dfs(self.df)
-            )
+            self.df = self.finalize_df(**self.split_into_dtype_dfs(self.df),
+                                       from_FTQC=True)
             return self.df
         except (AttributeError, KeyError, TypeError, ValueError) as e:
             self.debug_or_raise(e, locals())
 
 
-    def make_BIDS_files_dfs_no_explode(self, **dfs_BIDS: pd.DataFrame
-                                       ) -> pd.DataFrame:
-        """
-        :param dfs_BIDS: Dict[str, pd.DataFrame] mapping each data type str
-                         ("anat", "func", etc) to pd.DataFrame of data from
-                         files with that data type
-        :return: pd.DataFrame, valid BidsDB.df of ftq_series_id values, with
-                 1 subject session per row and 1 dtype-detail per column
-        """
-        self.COLS.ID.non = pd.Series(self.df[self.COLS.hdr].unique())
-        self.COLS.ID.non.sort_values(inplace=True)
-        self.COLS.lazysetdefault(
-            "all", lambda: self.COLS.ID.sub_ses + self.COLS.ID.non.tolist()
-        )
-        for dtype, eachdf in dfs_BIDS.items():
-            self.COLS[dtype] = eachdf[self.COLS.hdr].unique()
-        return (self.transform_dfs_to_BIDS_DB(self.COLS.QC, **dfs_BIDS)
-                if dfs_BIDS else self.get_empty_BIDS_DB_DF())
-
-
-    def read_FTQC_df_from(self, fpath_FTQC: str) -> pd.DataFrame:
+    @staticmethod
+    def read_FTQC_df_from(fpath_FTQC: str) -> pd.DataFrame:
         """
         :param fpath_FTQC: String, valid readable abcd_fastqc01.txt file path
         :return: pd.DataFrame of data read from fpath_FTQC
@@ -746,15 +739,15 @@ class Tier1BidsDB(BidsDB):
         self.tier1_dir = tier1_dir
 
         self.ensure_has_COLS(sub=sub_col, ses=ses_col, fname="NGDR_fpath",
-                             tier1_dir="tier1_dirpath",
-                             img2hdr_fpath=img2hdr_fpath)
+                            tier1_dir="tier1_dirpath",
+                            img2hdr_fpath=img2hdr_fpath)
         self.COLS.add_dtype_COLS()
 
-        self.df = self.get_DB_df(lambda: self.make_BIDS_files_dfs(
+        self.df = self.get_DB_df(lambda: self.finalize_df(
             # Restructure the pd.DataFrame for each dtype into 1 df with a
             # column for each detail we need; turn those details into columns
             # in the final df with 1 row per subject session
-            **self.get_BIDS_file_paths_df()
+            **self.get_BIDS_file_paths_df(), from_FTQC=False
         ), in_fpath, df)
 
         # Use the newly created dataframe to turn this into a BidsDB object
@@ -768,9 +761,13 @@ class Tier1BidsDB(BidsDB):
         :return: dict mapping each dtype to a pd.DataFrame with paths to all
                  local / tier 1 files of that dtype
         """
-        return {dtype: pd.DataFrame({self.COLS.fname: glob(build_NGDR_fpath(
-                    self.tier1_dir, dtype, f"*{self.file_ext}"
-                ))}) for dtype in self.dtypes}  # TODO Only execute glob once by using some kind of "{dtype1} OR {dtype2}" pattern matcher?
+        df_for = dict()
+        for dtype in self.dtypes:  # TODO Only execute glob once by using some kind of "{dtype1} OR {dtype2}" pattern matcher?
+            tier1_fpath = build_NGDR_fpath(self.tier1_dir, dtype,
+                                           f"*{self.file_ext}")
+            paths = glob(tier1_fpath)
+            df_for[dtype] = pd.DataFrame({self.COLS.fname: paths})
+        return df_for
 
 
 class S3BidsDB(BidsDB):
@@ -842,19 +839,16 @@ class S3BidsDB(BidsDB):
                  any), run number (if any), T1 or T2 (if applicable), acq (if
                  any), and task name (if any)
         """
-        # pd.DataFrame(pd.Series([urlparse.unquote(s3_datum["Key"]) for page in self.get_DB('s3').client.get_paginator('list_objects_v2').paginate(Bucket='ABCC_year1', ContinuationToken='', EncodingType='url', FetchOwner=False, StartAfter='', Prefix="sub-NDARINV0NXVE8CT/ses-baselineYear1Arm1/") for s3_datum in page["Contents"]]).str.split('/').values.tolist(), columns=['subject', 'session', 'dtype', 'fname']).groupby('dtype').apply(lambda df: pd.DataFrame(explode_col(df.fname, RGX_SPLIT, df.dtype.unique()[0]), columns=[x for x in RGX_SPLIT.SPLIT[df.dtype.unique()[0]] if x.isalpha()])).reset_index(level=1, drop=True).reset_index()
         df_COLS = [*self.COLS.ID.sub_ses, "dtype", self.COLS.fname]
-        # paths = pd.Series()
         paths = pd.Series([urlparse.unquote(s3_datum["Key"]) for page in
                            self.paginate(Bucket=bucket,
                                          Prefix=f"{subject}/{session}/")
                            for s3_datum in page["Contents"]])
         df = pd.DataFrame(paths.str.split('/').values.tolist(),
                           columns=df_COLS)
-        df = df.groupby('dtype').apply(lambda dtype_df:
-                                       self.split_df_by_all_dtypes(dtype_df))
+        df = df.groupby("dtype").apply(self.split_df_by_all_dtypes)
         df = df.reset_index(level=1, drop=True).reset_index()
-        return df.replace('', np.nan).dropna(axis=1, how="all")  # self.set_sub_ses_cols_as_index(
+        return df.replace("", np.nan).dropna(axis=1, how="all")
     
 
     def download_and_merge(self, *buckets: str) -> pd.DataFrame:
@@ -863,7 +857,6 @@ class S3BidsDB(BidsDB):
         :return: pd.DataFrame of all desired data downloaded from buckets
         """
         assert buckets  # assert len(buckets) > 0
-        pdb.set_trace()
         return pd.concat([S3Bucket(self.client, name, self.file_ext,
                                    self.dtypes, *self.COLS.ID.sub_ses,
                                    self.debugging).df for name in buckets])
@@ -915,9 +908,9 @@ class S3Bucket(S3BidsDB):
         self.dtypes = dtypes
         self.file_ext = file_ext
         self.name = bucket_name
-        self.session = BUCKET2SES[bucket_name]  # TODO Don't assume 1 bucket per session
+        # self.session = BUCKET2SES[bucket_name]  # Don't assume 1 bucket per session
 
-        with ShowTimeTaken(f"checking paths in s3://{self.name} bucket"):
+        with ShowTimeTaken(f"auditing s3://{self.name} bucket"):
             self.ensure_has_COLS(sub=sub_col, ses=ses_col,
                                  fname="s3_file_subpath",
                                  img2hdr_fpath=img2hdr_fpath)
@@ -929,9 +922,8 @@ class S3Bucket(S3BidsDB):
             if self.df.empty:  
                 self.df[self.COLS.ID.ses] = None
             else:
-                self.df = self.make_BIDS_files_dfs( 
-                    **self.get_BIDS_file_paths_df()
-                )
+                self.df = self.finalize_df(**self.get_BIDS_file_paths_df(),
+                                           from_FTQC=False)
 
             self.df = self.set_sub_ses_cols_as_index(self.df)
             super().__init__(client=client, buckets=list(), file_ext=file_ext,
@@ -942,20 +934,22 @@ class S3Bucket(S3BidsDB):
         """
         :return: Dict mapping a dtype to a pd.DataFrame with data of that type
         """
-        # Add self.df column with (URL-unformatted) file name/path strings
-        self.df[self.COLS.fname] = self.df[self.COLS.ID.sub
-                                           ].apply(self.get_BIDS_files_for)
-        all_files = self.df[self.COLS.fname].explode(ignore_index=True
-                                                     ).apply(urlparse.unquote)
-        
-        try:  # Get relevant all_files dataframe subsets (1 per dtype)
-            df_all = all_files.loc[all_files.str.endswith(self.file_ext)
-                                   ].to_frame()
-            df_all["dtype"] = explode_col(df_all[self.COLS.fname],
-                                          RGX_SPLIT, "dtype")
-            return self.split_into_dtype_dfs(df_all) 
-        except (IndexError, KeyError) as e:
-            self.debug_or_raise(e, locals())
+        with ShowTimeTaken(f"downloading s3://{self.name} paths"):
+            # Add self.df column with (URL-unformatted) file name/path strings
+            self.df[self.COLS.fname] = self.df[self.COLS.ID.sub
+                                            ].apply(self.get_BIDS_files_for)
+        with ShowTimeTaken(f"reformatting s3://{self.name} dataframe"):
+            all_files = self.df[self.COLS.fname].explode(ignore_index=True
+                                                        ).apply(urlparse.unquote)
+            
+            try:  # Get relevant all_files dataframe subsets (1 per dtype)
+                df_all = all_files.loc[all_files.str.endswith(self.file_ext)
+                                    ].to_frame()
+                df_all["dtype"] = explode_col(df_all[self.COLS.fname],
+                                              RGX_SPLIT, "dtype")
+                return self.split_into_dtype_dfs(df_all) 
+            except (IndexError, KeyError) as e:
+                self.debug_or_raise(e, locals())
 
 
     def get_bids_subject_IDs_df(self) -> pd.Series:
@@ -998,7 +992,7 @@ class AllBidsDBs(BidsDB):
              ["fpath_FTQC"]],
             [Tier1BidsDB, "Tier 1", "the NGDR space on the MSI",
              ["tier1_dir", "file_ext"]],
-            [S3BidsDB, "Tier 2", "these AWS s3 buckets: " +
+            [S3BidsDB, "Tier 2", "the AWS s3 buckets " +
              ", ".join(self["buckets"]), ["client", "buckets", "file_ext"]]
         ], columns=["DB", "db_name", "src", "kwargs"], index=WHICH_DBS)
 
@@ -1108,7 +1102,6 @@ class AllBidsDBs(BidsDB):
         if which_cols:
             kwargs4save["columns"] = which_cols
         try:
-            pdb.set_trace()
             fpath = self.make_outfile_path(uniq_fname_part)
             self.df.to_csv(fpath, **kwargs4save)
         except TypeError as e:
@@ -1120,8 +1113,6 @@ class AllBidsDBs(BidsDB):
         Save summary dataframes to .tsv files 
         """
         self.lazysetdefault("df", self.summarize)  # Get summary df
-        if self.debugging:
-            pdb.set_trace()
 
         # Save summary dataframe(s) of coverage info for all subject sessions
         self.save_summary("audit-summary", ("complete", "coverage_s3",
@@ -1133,12 +1124,13 @@ class AllBidsDBs(BidsDB):
         is_checked_ses = self.df['session'].isin(set(BUCKET2SES.values()))
         are_complete = ((self.df['coverage_s3'] == 1.0) |
                         (self.df['coverage_tier1'] == 1.0))
-        for which in ("complete", "incomplete"):
-            for completeness in (are_complete, ~are_complete):
-                self.save_subj_ses_list(f"{which}-subj-ses",
-                                        completeness & is_checked_ses)
-                self.save_subj_ses_list(f"no-files-{which}", completeness &
-                                        ~self.df["any_files"] & is_checked_ses)
+        cmplt = {"complete": are_complete, "incomplete": ~are_complete}
+        for which, completeness in cmplt.items():
+            # for completeness in (are_complete, ~are_complete):
+            self.save_subj_ses_list(f"{which}-subj-ses",
+                                    completeness & is_checked_ses)
+            self.save_subj_ses_list(f"no-files-{which}", completeness &
+                                    ~self.df["any_files"] & is_checked_ses)
 
 
     def summarize(self) -> None:
@@ -1206,7 +1198,7 @@ class AllBidsDBs(BidsDB):
             if sub_ses_row.get(f"coverage_{loc_key}") == 1.0:
                 is_complete_on.append(loc_key)
 
-        # If is_complete_on: neither, say so; both, say so; only 1, name which
+        # If is_complete_on neither or both, say so; if on only 1, name which
         return LazyDict({2: "complete (both)", 0: "incomplete"}).lazyget(
             len(is_complete_on), lambda: f"complete ({is_complete_on[0]})"
         )

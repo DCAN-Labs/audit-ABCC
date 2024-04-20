@@ -3,7 +3,7 @@
 """
 Utilities for ABCC auditing workflow
 Originally written by Anders Perrone
-Updated by Greg Conan on 2024-04-10
+Updated by Greg Conan on 2024-04-18
 """
 # Standard imports
 import argparse
@@ -22,6 +22,7 @@ import subprocess as sp
 import sys
 from typing import (Any, Dict, Generator, Iterable, List,  # Literal, 
                     Mapping, Optional, Set, Tuple, Union)
+import yaml
 
 # External (pip/PyPI) imports
 import boto3
@@ -120,7 +121,7 @@ class Debuggable:  # I put the debugger function in a class so it can use its
 
 
 class ColHeaderFactory(Debuggable):
-    # 
+    # TODO explain
     DTYPE_2_PREFIX_AND_UNIQ = {"func": ("task-", "task"),
                                "anat": ("T", "Tw"),
                                "fmap": ("FM_", "dir"),
@@ -130,7 +131,7 @@ class ColHeaderFactory(Debuggable):
 
     def __init__(self, debugging: bool = False, will_add_run: bool = False,
                  dtype: Optional[str] = None, run_col: Optional[str] = "run",
-                 uniq_col: Optional[str] = None) -> None:  #, prefix: Optional[str] = ""
+                 uniq_col: Optional[str] = None) -> None:
         """
         _summary_ 
         :param debugging: True to pause & interact on error or False to crash
@@ -339,8 +340,8 @@ def debug(an_err: Exception, local_vars: Mapping[str, Any]) -> None:
     pdb.set_trace()
 
 
-def default_pop(poppable: Any, key: Optional[Any] = None,
-                default: Optional[Any] = None) -> Any:
+def default_pop(poppable: Any, key: Any = None,
+                default: Any = None) -> Any:
     """
     :param poppable: Any object which implements the .pop() method
     :param key: Input parameter for .pop(), or None to call with no parameters
@@ -349,7 +350,7 @@ def default_pop(poppable: Any, key: Optional[Any] = None,
     """
     try:
         to_return = poppable.pop() if key is None else poppable.pop(key)
-    except (AttributeError, IndexError):
+    except (AttributeError, IndexError, KeyError):
         to_return = default
     return to_return
 
@@ -375,6 +376,16 @@ def fill_run(ser):
         else:
             pdb.set_trace()
     return ser
+
+
+def get_ERI_filepath(bids_dir_path: str) -> str:
+    """
+    :param bids_dir_path: str, valid path to BIDS root directory
+    :return: str, globbable incomplete path to EventRelatedInformation file
+    """
+    return build_NGDR_fpath(os.path.join(bids_dir_path, "sourcedata"),
+                            "func", "task-*_run-*_bold_"
+                            "EventRelatedInformation.txt")
 
 
 def get_most_recent_FTQC_fpath(incomplete_dirpath_FTQC: str) -> str:
@@ -412,14 +423,20 @@ def get_most_recent_FTQC_fpath(incomplete_dirpath_FTQC: str) -> str:
     return most_recent_FTQC
 
 
-def get_ERI_filepath(bids_dir_path: str) -> str:
+def get_nested_attribute_from(an_obj: Any, *attribute_names: str) -> Any:
     """
-    :param bids_dir_path: str, valid path to BIDS root directory
-    :return: str, globbable incomplete path to EventRelatedInformation file
+    get_nested_attribute_from(an_obj, "first", "second", "third") will return
+    an_obj.first.second.third if it exists, and None if it doesn't.
+    :param an_obj: Any
+    :param attribute_names: Iterable[str] of attribute names. The first names
+                            an attribute of an_obj; the second names an
+                            attribute of that first attribute; and etc. 
+    :return: Any, the attribute of ... of an attribute of an_obj
     """
-    return build_NGDR_fpath(os.path.join(bids_dir_path, "sourcedata"),
-                            "func", "task-*_run-*_bold_"
-                            "EventRelatedInformation.txt")
+    attributes = list(attribute_names)
+    while attributes and (an_obj is not None):
+        an_obj = getattr(an_obj, attributes.pop(0), None)
+    return an_obj
 
 
 def get_tier1_or_tier2_ERI_db_fname(parent_dir: str, tier: int) -> str:
@@ -827,22 +844,6 @@ def extract_from_json(json_path: str) -> Dict:
         return json.load(infile)
 
 
-def s3_get_info() -> LazyDict:
-    """
-    :return: Dictionary containing all of the information in the output of the
-            "s3info" command in the Unix Bash terminal (via subprocess)
-    """
-    user_s3info = sp.check_output(("s3info")).decode("utf-8").split("\n")
-    aws_s3info = LazyDict()
-    for eachline in user_s3info:
-        # if eachline != "":
-        split = eachline.split(":")
-        if len(split) > 1:
-            split = [x.strip() for x in split]
-            aws_s3info[split[0].lower()] = split[-1]
-    return aws_s3info
-
-
 def save_to_hash_map_table(sub_ses_df: pd.DataFrame, subj_col: str,
                            ses_col: str, in_dirpath: str, out_dirpath: str,
                            outfile_path: str, subdirnames=list()) -> None:
@@ -1046,11 +1047,11 @@ def uniqs_in(listlike: Iterable[Hashable]) -> list:
 class UserAWSCreds:
     # AWS s3 key names and their lengths
     NAMES = ["access", "secret"]
-    LENS = {key: keylen for key, keylen in zip(NAMES, [20, 40])}
+    LENS = {"access": 20, "secret": 40} # {key: keylen for key, keylen in zip(NAMES, [20, 40])}
 
 
-    def __init__(self, cli_args: Mapping[str, Any],
-                 parser: argparse.ArgumentParser) -> None:
+    def __init__(self, cli_args: Mapping[str, Any], parser:
+                 argparse.ArgumentParser = argparse.ArgumentParser()) -> None:
         """
         _summary_ 
         :param cli_args: Mapping[str, Any] of command-line input arguments
@@ -1068,7 +1069,7 @@ class UserAWSCreds:
                              "manual" to prompt the user for those keys, or
                              None to try to get keys other ways, or something
                              else to raise an error  
-        :return: LazyDict mapping 
+        :return: LazyDict, __description__ 
         """
         aws_creds = LazyDict()  # Return value
         if keys_initial:
@@ -1080,8 +1081,15 @@ class UserAWSCreds:
                     aws_creds[self.NAMES[i]] = keys_initial[i]
         else:
             try:
-                aws_creds = s3_get_info()
-            except (sp.CalledProcessError, ValueError):
+                s3info = yaml.safe_load(sp.check_output("s3info",
+                                                        encoding="utf-8"))
+                for name in self.NAMES:
+                    aws_creds[name] = s3info[f"{name.capitalize()} key"]
+                # aws_creds = LazyDict({name: s3info[f"{name.capitalize()} key"]  for name in self.NAMES})
+                # aws_creds = LazyDict({k.lower(): v for k,v in yaml.safe_load(sp.check_output("s3info", encoding="utf-8")).items()})
+                # self.keys = [aws_creds["Access key"], aws_creds["Secret key"]]
+                # aws_creds = s3_get_info()
+            except (sp.CalledProcessError, KeyError, ValueError):
                 pass
         for key_name in self.NAMES:
             aws_creds.lazysetdefault(key_name, lambda:

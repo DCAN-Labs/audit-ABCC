@@ -4,7 +4,7 @@
 ABCC Audit Main Script 
 Greg Conan: gregmconan@gmail.com
 Created: 2022-07-06
-Updated: 2024-04-03
+Updated: 2024-04-18
 """
 # Standard imports
 import argparse
@@ -17,7 +17,7 @@ from typing import Any, Dict, Mapping, Set
 from src.BidsDB import AllBidsDBs
 from src.utilities import (
     dt_format, get_most_recent_FTQC_fpath, IMG_DSC_2_COL_HDR_FNAME,
-    PATH_NGDR, s3_get_info, SplitLogger, UserAWSCreds, valid_output_dir,
+    PATH_NGDR, SplitLogger, UserAWSCreds, valid_output_dir,
     valid_readable_dir, valid_readable_file, WHICH_DBS
 )
 
@@ -31,12 +31,13 @@ def main():
     # Make all BIDS DBs: fast-track QC DB, tier1 (NGDR) DB, and finally tier 2
     # (s3), finishing with s3 so that it can use the subject-session pairings 
     # from the other BIDS DBs to know which to pull(?)
-    client = make_s3_client_from_cli_args(cli_args)
+    client = UserAWSCreds(cli_args, argparse.ArgumentParser()).get_s3_client()
     all_DBs = AllBidsDBs(cli_args, client=client,
                          sub_col="subject", ses_col="session")
     for key in WHICH_DBS:  # First "ftqc", then "tier1", then "s3"
         if key in cli_args["audit"]:
             all_DBs.add_DB(key)
+            
 
     if len(cli_args["audit"]) == 3:       
         all_DBs.summarize()
@@ -62,20 +63,6 @@ def pick_DBs_to_save(cli_args: Dict[str, Any]) -> Set[str]:
     return to_save
 
 
-def make_s3_client_from_cli_args(cli_args: Mapping[str, Any]):
-    """
-    Get AWS credentials to access s3 buckets 
-    :param cli_args: Mapping[str, Any] of command-line input arguments
-    :return: boto3.session.Session.client, _description_
-    """
-    if not cli_args["aws_keys"]:
-        my_s3info = s3_get_info()
-        if my_s3info:
-            cli_args["aws_keys"] = [my_s3info["access key"],
-                                    my_s3info["secret key"]]
-    return UserAWSCreds(cli_args, argparse.ArgumentParser()).get_s3_client()
-
-
 def make_logger_from_cli_args(cli_args: Mapping[str, Any]):
     """
     Get logger, and prepare it to log to a file if the user said to 
@@ -89,7 +76,7 @@ def make_logger_from_cli_args(cli_args: Mapping[str, Any]):
         else:
             cli_args["log"] = os.path.join(cli_args["output"], cli_args["log"])
         log_to = dict(out=cli_args["log"], err=cli_args["log"])
-    return SplitLogger(cli_args["verbosity"], **log_to)  # make_logger(cli_args["verbosity"], **log_to)
+    return SplitLogger(cli_args["verbosity"], **log_to)
 
 
 def _cli() -> Dict[str, Any]: 
@@ -131,7 +118,7 @@ def _cli() -> Dict[str, Any]:
         "-bids", "--bids-dir", "--tier-1-dir", "--local-dir", "--dirpath",
         dest="tier1_dir",
         default=PATH_NGDR,
-        type=valid_readable_dir,
+        # type=valid_readable_dir,
         help=(f"{MSG_VALID_PATH} directory structured in BIDS input data "
               f"format.{MSG_DEFAULT.format(PATH_NGDR)}")
     )
@@ -252,7 +239,14 @@ def _cli() -> Dict[str, Any]:
         help=("Include this flag to print more info to stdout while running. "
               "Including the flag more times will print more information.")
     )
-    return vars(parser.parse_args())  
+    return validate_cli_args(vars(parser.parse_args()), parser)
+
+
+def validate_cli_args(cli_args: Mapping[str, Any],
+                      parser: argparse.ArgumentParser) -> Dict[str, Any]:
+    if "tier1" in cli_args["audit"] and not cli_args.get("tier1_DB_file"):
+        valid_readable_dir(cli_args["tier1_dir"])
+    return cli_args
 
 
 if __name__ == "__main__":

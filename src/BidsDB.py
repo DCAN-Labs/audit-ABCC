@@ -4,7 +4,7 @@
 ABCC Audit BIDS DB Object Classes
 Greg Conan: gregmconan@gmail.com
 Created: 2024-01-18
-Updated: 2024-04-09
+Updated: 2024-04-19
 """
 # Standard imports
 import functools
@@ -145,12 +145,13 @@ class BidsDBDetailsForType(Debuggable):
                  drop_NaN_from: Optional[Iterable[str]] = list(),
                  debugging: bool = False) -> None:
         """
+        :param dtype: str, data type, a key in DTYPE_2_UNIQ_COLS
         :param df: pd.DataFrame with a column named self.COLS.fname of file
                    name/path strings to split into new columns if not from_FTQC
-        :param dtype: str, data type, a key in DTYPE_2_UNIQ_COLS
-        :param col_to_get: String naming the column of the BidsDB pd.DataFrame
-                           to keep values from in the final pd.DataFrame
+        :param col_to_keep: String naming the column of the BidsDB pd.DataFrame
+                            to keep values from in the final pd.DataFrame
         :param db_COLS: BidsDBColumnNames, _description_
+        :param drop_NaN_from: Iterable[str], names of columns to drop NaNs from
         """
         self.COLS = db_COLS
         self.col_to_keep = col_to_keep
@@ -198,7 +199,6 @@ class BidsDBDetailsForType(Debuggable):
     def make_df_from_fpaths(self):  # , *drop_NaN_from: str):
         """
         Split filenames into new columns with all relevant details for its dtype
-        :param drop_NaN_from: Iterable[str], names of columns to drop NaNs from
         """
         try:
             dtype_ID_COLS = self.COLS.ID.get(self.dtype)
@@ -234,7 +234,6 @@ class BidsDBDetailsForType(Debuggable):
                                 columns=[*self.COLS.ID.sub_ses,
                                          *sub_ses_dict_cols])
         return final_df.dropna(how="all", axis=1)
-        
 
 
     def make_subj_ses_dict(self, a_df: pd.DataFrame, dict_cols: Iterable[str]
@@ -758,7 +757,7 @@ class Tier1BidsDB(BidsDB):
                  local / tier 1 files of that dtype
         """
         df_for = dict()
-        for dtype in self.dtypes:  # TODO Only execute glob once by using some kind of "{dtype1} OR {dtype2}" pattern matcher?
+        for dtype in self.dtypes:  # TODO Only execute glob once by using some kind of "{dtype1} OR {dtype2}" pattern matcher? No, that's too many files to glob at once?
             tier1_fpath = build_NGDR_fpath(self.tier1_dir, dtype,
                                            f"*{self.file_ext}")
             paths = glob(tier1_fpath)
@@ -769,7 +768,7 @@ class Tier1BidsDB(BidsDB):
 class S3BidsDB(BidsDB):
     def __init__(self, client: boto3.session.Session.client,
                  buckets: List[str], file_ext: str, dtypes: Iterable[str],
-                 in_fpath:  Optional[str] = None,
+                 sessions: Iterable[str], in_fpath:  Optional[str] = None,
                  out_fpath: Optional[str] = None,
                  sub_col: Optional[str] = None, ses_col: Optional[str] = None,
                  df: Optional[pd.DataFrame] = None, debugging: bool = False,
@@ -791,6 +790,7 @@ class S3BidsDB(BidsDB):
         self.dtypes = dtypes
         self.client = client
         self.file_ext = file_ext
+        self.sessions = sessions
         self.ensure_has_COLS(sub=sub_col, ses=ses_col,
                              img2hdr_fpath=img2hdr_fpath,
                              fname="s3_file_relative_path")
@@ -854,18 +854,18 @@ class S3BidsDB(BidsDB):
         """
         assert buckets  # assert len(buckets) > 0
         return pd.concat([S3Bucket(self.client, name, self.file_ext,
-                                   self.dtypes, *self.COLS.ID.sub_ses,
-                                   self.debugging).df for name in buckets])
+                                   self.dtypes, self.sessions,
+                                   *self.COLS.ID.sub_ses, self.debugging
+                                   ).df for name in buckets])
 
 
-    def get_BIDS_files_for(self, subj_ID: str, session: Optional[str] = None
-                           ) -> List[Dict[str, str]]:
+    def get_BIDS_files_for(self, row: pd.Series) -> List[Dict[str, str]]:
         """
         :param subj_ID: Participant ID, "sub-NDARINV" followed by 8 characters
-        :return: List[Dict[str,str]] of each subj_ID file details, or None
+        :return: List[Dict[str,str]] of details about the file in row, or None
         """
-        if not session:
-            session = self.session
+        subj_ID = row.get(self.COLS.ID.sub)
+        session = row.get(self.COLS.ID.ses)
         return self.download("Contents", "Key", f"{subj_ID}/{session}/")
 
 
@@ -876,7 +876,6 @@ class S3BidsDB(BidsDB):
         :return: Iterator (over s3 bucket objects) yielding pages which act 
                  like nested dicts of strings: Dict[str, Dict[str, Dict[...]]]
         """
-        # if not kwargs.get("Bucket")
         kwargs.setdefault("Bucket", self.name)
         return self.client.get_paginator("list_objects_v2").paginate(
             FetchOwner=False, EncodingType="url", ContinuationToken="", 
@@ -886,7 +885,7 @@ class S3BidsDB(BidsDB):
 
 class S3Bucket(S3BidsDB):
     def __init__(self, client: boto3.session.Session.client, bucket_name: str,
-                 file_ext: str, dtypes: Iterable[str],
+                 file_ext: str, dtypes: Iterable[str], sessions: Iterable[str], 
                  sub_col: Optional[str] = None, ses_col: Optional[str] = None,
                  debugging: bool = False, img2hdr_fpath: Optional[str] = None
                  ) -> None:
@@ -904,26 +903,21 @@ class S3Bucket(S3BidsDB):
         self.dtypes = dtypes
         self.file_ext = file_ext
         self.name = bucket_name
-        self.session = BUCKET2SES[bucket_name]  # TODO Don't assume 1 bucket per session
+        self.sessions = sessions
 
         with ShowTimeTaken(f"auditing s3://{self.name} bucket"):
             self.ensure_has_COLS(sub=sub_col, ses=ses_col,
                                  fname="s3_file_subpath",
                                  img2hdr_fpath=img2hdr_fpath)
-            self.df = self.get_bids_subject_IDs_df()
+            self.df = self.get_BIDS_IDs_df()
             self.COLS.add_dtype_COLS()
-
-            # If the bucket has no subjects, then instead of adding content 
-            # for each subject session, add an empty session column
-            if self.df.empty:  
-                self.df[self.COLS.ID.ses] = None
-            else:
-                self.df = self.finalize_df(**self.get_BIDS_file_paths_df(),
-                                           from_FTQC=False)
+            self.df = self.finalize_df(**self.get_BIDS_file_paths_df(),
+                                        from_FTQC=False)
 
             self.df = self.set_sub_ses_cols_as_index(self.df)
-            super().__init__(client=client, buckets=list(), file_ext=file_ext,
-                             dtypes=dtypes, df=self.df, debugging=debugging)
+            super().__init__(client=client, buckets=list(), sessions=sessions,
+                             file_ext=file_ext, dtypes=dtypes, df=self.df,
+                             debugging=debugging)
 
 
     def get_BIDS_file_paths_df(self) -> Dict[str, pd.DataFrame]:
@@ -932,15 +926,17 @@ class S3Bucket(S3BidsDB):
         """
         with ShowTimeTaken(f"downloading s3://{self.name} paths"):
             # Add self.df column with (URL-unformatted) file name/path strings
-            self.df[self.COLS.fname] = self.df[self.COLS.ID.sub
-                                            ].apply(self.get_BIDS_files_for)
+            self.df[self.COLS.fname] = \
+                self.df.apply(self.get_BIDS_files_for, axis=1)
+            
         with ShowTimeTaken(f"reformatting s3://{self.name} dataframe"):
-            all_files = self.df[self.COLS.fname].explode(ignore_index=True
-                                                        ).apply(urlparse.unquote)
+            all_files = self.df[self.COLS.fname].explode(ignore_index=True)
+            all_files.dropna(inplace=True)
+            all_files = all_files.apply(urlparse.unquote)
             
             try:  # Get relevant all_files dataframe subsets (1 per dtype)
                 df_all = all_files.loc[all_files.str.endswith(self.file_ext)
-                                    ].to_frame()
+                                       ].to_frame()
                 df_all["dtype"] = explode_col(df_all[self.COLS.fname],
                                               RGX_SPLIT, "dtype")
                 return self.split_into_dtype_dfs(df_all) 
@@ -948,19 +944,25 @@ class S3Bucket(S3BidsDB):
                 self.debug_or_raise(e, locals())
 
 
-    def get_bids_subject_IDs_df(self) -> pd.Series:
+    def get_BIDS_IDs_df(self, sessions: Iterable[str] = set()) -> pd.DataFrame:
         """
-        :return: pd.Series, a column of all subject IDs in the s3 bucket
+        :return: pd.DataFrame with a column of all subject IDs in the s3 bucket
         """
-        subj_IDs = pd.Series(self.download("CommonPrefixes", "Prefix",
-                                           "", Delimiter="/"))
-        subj_IDs = (subj_IDs.to_frame() if subj_IDs.empty else
-                    subj_IDs.str.extract(RGX_SPLIT.create("subj")).dropna())
-        return subj_IDs.rename(columns={0: self.COLS.ID.sub})
+        try:
+            all_IDs = pd.Series(self.download("CommonPrefixes", "Prefix",
+                                              "", Delimiter="/"))
+            all_IDs = (all_IDs.to_frame() if all_IDs.empty else
+                       all_IDs.str.extract(RGX_SPLIT.create("subj")).dropna())
+            all_IDs = all_IDs.rename(columns={0: self.COLS.ID.sub})
+            # if not sessions: sessions = self.get("sessions", set())  # TODO
+            sessions = self.get("sessions", set(sessions))
+            all_IDs[self.COLS.ID.ses] = [sessions] * all_IDs.shape[0]
+            return all_IDs.explode(self.COLS.ID.ses, ignore_index=True)
+        except ValueError as e:
+            self.debug_or_raise(e, locals())
 
 
 class AllBidsDBs(BidsDB):
-
     def __init__(self, cli_args: Mapping[str, Any], 
                  sub_col: str, ses_col: str,
                  client: boto3.session.Session.client = None) -> None:
@@ -976,7 +978,6 @@ class AllBidsDBs(BidsDB):
 
         self.ensure_has_COLS(sub=sub_col, ses=ses_col,
                              img2hdr_fpath=self.img2hdr_fpath)
-        # self.COLS = LazyDict(sub_col=sub_col, ses_col=ses_col)
         self.DB = list()       # List[BidsDB] created/read during this run
         self.ix_of = dict()    # Dict[str, int]: indices of DBs in self.DB
         self.out_fpaths = {key: self.build_out_fpath(key)  # File path strings
@@ -989,7 +990,8 @@ class AllBidsDBs(BidsDB):
             [Tier1BidsDB, "Tier 1", "the NGDR space on the MSI",
              ["tier1_dir", "file_ext"]],
             [S3BidsDB, "Tier 2", "the AWS s3 buckets " +
-             ", ".join(self["buckets"]), ["client", "buckets", "file_ext"]]
+             ", ".join(self["buckets"]), ["client", "buckets",
+                                          "file_ext", "sessions"]]
         ], columns=["DB", "db_name", "src", "kwargs"], index=WHICH_DBS)
 
 
@@ -1015,6 +1017,13 @@ class AllBidsDBs(BidsDB):
             self.DB.append(self.make_DB(key, which.DB, **{
                 kwarg: self[kwarg] for kwarg in which.kwargs
             }))
+            
+            # Get names of sessions to check for in s3 bucket(s)
+            if "s3" in self["audit"] and key != "s3":
+                self.sessions = self.get("sessions", set()).union(
+                    set(self.get_DB(key).df.index.get_level_values( \
+                            self.COLS.ID.ses).unique().values)
+                )
 
 
     def build_out_fpath(self, key_DB: str) -> str:
@@ -1085,8 +1094,8 @@ class AllBidsDBs(BidsDB):
                               columns=self.COLS.ID.sub_ses)  # [self.COLS.sub_col, self.COLS.ses_col])
         
 
-    def save_summary(self, uniq_fname_part: str, which_cols: str = list()
-                     ) -> None:
+    def save_summary(self, uniq_fname_part: str,
+                     which_cols: Iterable[str] = list()) -> None:
         """
         Save certain columns of the audit into a .tsv file
         :param uniq_fname_part: String in output file name identifying what
@@ -1122,7 +1131,6 @@ class AllBidsDBs(BidsDB):
                         (self.df['coverage_tier1'] == 1.0))
         cmplt = {"complete": are_complete, "incomplete": ~are_complete}
         for which, completeness in cmplt.items():
-            # for completeness in (are_complete, ~are_complete):
             self.save_subj_ses_list(f"{which}-subj-ses",
                                     completeness & is_checked_ses)
             self.save_subj_ses_list(f"no-files-{which}", completeness &

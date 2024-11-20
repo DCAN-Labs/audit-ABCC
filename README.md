@@ -15,12 +15,12 @@
 
 
 # Potentially useful files: 
-`complete-subj-ses_BIDS_DB_2024-08-30_19-15-35.tsv`: list of complete subjects/sessions (have all expected files)
-`incomplete-subj-ses_BIDS_DB_2024-08-30_19-15-35.tsv`: list of incomplete subjects/sessions (missing some or all expected files)
+- `complete-subj-ses_BIDS_DB_2024-08-30_19-15-35.tsv`: list of complete subjects/sessions (have all expected files)
+- `incomplete-subj-ses_BIDS_DB_2024-08-30_19-15-35.tsv`: list of incomplete subjects/sessions (missing some or all expected files)
 
 
 # Other
-`no-files-complete_BIDS_DB_2024-08-30_19-15-35.tsv` : list of subjects/sessions missing all expected files from s3, but all expected files present on NGDR??
-`no-files-incomplete_BIDS_DB_2024-08-30_19-15-35.tsv`: list of subjects/sessions missing all expected files from s3, and incomplete on NGDR as well???
-`tier1_BIDS_DB_2024-08-30_18-27-53.tsv`
-`ftqc_BIDS_DB_2024-08-30_18-27-53.tsv`
+- `no-files-complete_BIDS_DB_2024-08-30_19-15-35.tsv` : list of subjects/sessions missing all expected files from s3, but all expected files present on NGDR??
+- `no-files-incomplete_BIDS_DB_2024-08-30_19-15-35.tsv`: list of subjects/sessions missing all expected files from s3, and incomplete on NGDR as well???
+- `tier1_BIDS_DB_2024-08-30_18-27-53.tsv`
+- `ftqc_BIDS_DB_2024-08-30_18-27-53.tsv`
